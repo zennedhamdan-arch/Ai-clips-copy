@@ -39,6 +39,24 @@ export const config = {
   r2BucketName: process.env.R2_BUCKET_NAME?.trim() || "",
   r2Endpoint: process.env.R2_ENDPOINT?.trim().replace(/\/$/, "") || "",
   frontendUrl: process.env.FRONTEND_URL?.trim().replace(/\/$/, "") || "",
+
+  /**
+   * Backblaze B2 — separate permanent Music Library.
+   * R2 keeps owning videos/sources/clips/posters/jobs; B2 only stores music.
+   * These values are server-only and must never use NEXT_PUBLIC_ names.
+   */
+  b2Endpoint: process.env.B2_ENDPOINT?.trim().replace(/\/+$/, "") || "",
+  b2Region: process.env.B2_REGION?.trim() || "",
+  b2KeyId: process.env.B2_KEY_ID?.trim() || "",
+  b2ApplicationKey: process.env.B2_APPLICATION_KEY?.trim() || "",
+  b2MusicBucket: process.env.B2_MUSIC_BUCKET?.trim() || "clipforge-music",
+  /** Parallel music uploads allowed at once (keeps a 512 MB host safe). */
+  musicUploadConcurrency: num("MUSIC_UPLOAD_CONCURRENCY", 2),
+  /** Upper bound on files accepted by a single bulk upload request. */
+  musicMaxFilesPerBatch: num("MUSIC_MAX_FILES_PER_BATCH", 25),
+  /** Rows per page for the Music Library and the B2 storage listing. */
+  musicPageSize: num("MUSIC_PAGE_SIZE", 24),
+
   /** Optional admin-only storage explorer credential (server-only). */
   adminPassword: process.env.ADMIN_PASSWORD || "",
   minFreeDiskMb: num("MIN_FREE_DISK_MB", 1500),

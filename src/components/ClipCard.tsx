@@ -4,6 +4,7 @@ import { useState } from "react";
 import type { ApiClip } from "@/lib/types";
 
 export type ClipMusicAsset = { id: string; name: string; fileName: string };
+export type ClipMusicTrack = { id: string; displayName: string; durationSec: number | null };
 
 export function formatBytes(bytes: number | null | undefined): string {
   if (!bytes) return "—";
@@ -27,27 +28,60 @@ function scoreColour(score: number | null): string {
   return "bg-slate-600/30 text-slate-300 ring-1 ring-slate-500/40";
 }
 
-export function ClipCard({ clip, musicAssets = [], onChanged }: {
+export function ClipCard({ clip, musicAssets = [], musicTracks = [], onChanged }: {
   clip: ApiClip;
   musicAssets?: ClipMusicAsset[];
+  musicTracks?: ClipMusicTrack[];
   onChanged?: () => void | Promise<void>;
 }) {
-  const [assetId, setAssetId] = useState(clip.musicAssetId ?? musicAssets[0]?.id ?? "");
+  const initialChoice = clip.musicTrackId
+    ? `b2:${clip.musicTrackId}`
+    : clip.musicAssetId
+      ? `r2:${clip.musicAssetId}`
+      : musicTracks[0]
+        ? `b2:${musicTracks[0].id}`
+        : musicAssets[0]
+          ? `r2:${musicAssets[0].id}`
+          : "auto";
+  const [musicChoice, setMusicChoice] = useState(initialChoice);
   const [volume, setVolume] = useState(Math.round((clip.musicVolume ?? 0.12) * 100));
   const [busy, setBusy] = useState(false);
   const [musicError, setMusicError] = useState<string | null>(null);
+  const [musicNote, setMusicNote] = useState<string | null>(null);
+  const hasMusicLibrary = musicAssets.length > 0 || musicTracks.length > 0;
+
   async function changeMusic(method: "POST" | "DELETE") {
     setBusy(true);
     setMusicError(null);
+    setMusicNote(null);
     const progressTimer = window.setInterval(() => void onChanged?.(), 1500);
     try {
+      const body = method === "POST"
+        ? JSON.stringify({
+            volume: volume / 100,
+            ...(musicChoice === "auto"
+              ? { auto: true }
+              : musicChoice.startsWith("b2:")
+                ? { trackId: musicChoice.slice(3) }
+                : { assetId: musicChoice.slice(3) }),
+          })
+        : undefined;
       const response = await fetch(`/api/clips/${clip.id}/music`, {
         method,
         headers: method === "POST" ? { "Content-Type": "application/json" } : undefined,
-        body: method === "POST" ? JSON.stringify({ assetId, volume: volume / 100 }) : undefined,
+        body,
       });
-      const data = await response.json() as { error?: string };
+      const data = await response.json() as {
+        error?: string;
+        music?: { displayName?: string; selection?: { source?: string; reason?: string } | null; note?: string | null };
+      };
       if (!response.ok) throw new Error(data.error || `Music request failed (${response.status})`);
+      const selection = data.music?.selection;
+      setMusicNote(
+        selection
+          ? `${selection.source === "ai" ? "✨ AI picked" : "Matched"}: ${data.music?.displayName ?? ""} — ${selection.reason}`
+          : data.music?.note ?? null,
+      );
       await onChanged?.();
     } catch (error) {
       setMusicError((error as Error).message);
@@ -123,16 +157,30 @@ export function ClipCard({ clip, musicAssets = [], onChanged }: {
           ) : null}
         </div>
 
-        {musicAssets.length ? (
+        {hasMusicLibrary ? (
           <div className="space-y-2 rounded-xl border border-white/10 bg-black/20 p-3">
             <div className="flex items-center justify-between">
-              <span className="text-xs font-semibold text-slate-200">Background music</span>
+              <span className="text-xs font-semibold text-slate-200">Add background music</span>
               <span className={`text-[10px] uppercase tracking-wide ${clip.musicStatus === "failed" ? "text-red-300" : clip.musicEnabled ? "text-emerald-300" : "text-slate-500"}`}>
-                {busy ? (clip.musicStatus === "uploading" ? "Uploading" : "Applying") : clip.musicStatus === "complete" ? "Complete" : clip.musicStatus}
+                {busy ? (clip.musicStatus === "uploading" ? "Uploading" : "Mixing") : clip.musicStatus === "complete" ? "Complete" : clip.musicStatus}
               </span>
             </div>
-            <select value={assetId} onChange={(event) => setAssetId(event.target.value)} disabled={busy} className="w-full rounded-lg border border-white/10 bg-slate-900 px-2 py-2 text-xs text-white">
-              {musicAssets.map((asset) => <option key={asset.id} value={asset.id}>{asset.name} ({asset.fileName})</option>)}
+            <select value={musicChoice} onChange={(event) => setMusicChoice(event.target.value)} disabled={busy} className="w-full rounded-lg border border-white/10 bg-slate-900 px-2 py-2 text-xs text-white">
+              <option value="auto">✨ Auto-pick (AI, metadata only)</option>
+              {musicTracks.length ? (
+                <optgroup label="Music Library (B2)">
+                  {musicTracks.map((track) => (
+                    <option key={track.id} value={`b2:${track.id}`}>🎵 {track.displayName}</option>
+                  ))}
+                </optgroup>
+              ) : null}
+              {musicAssets.length ? (
+                <optgroup label="Media Library (R2)">
+                  {musicAssets.map((asset) => (
+                    <option key={asset.id} value={`r2:${asset.id}`}>{asset.name} ({asset.fileName})</option>
+                  ))}
+                </optgroup>
+              ) : null}
             </select>
             <label className="flex items-center gap-2 text-[11px] text-slate-400">
               Volume
@@ -140,13 +188,14 @@ export function ClipCard({ clip, musicAssets = [], onChanged }: {
               <span className="w-8 text-right">{volume}%</span>
             </label>
             <div className="flex gap-2">
-              <button type="button" disabled={busy || !assetId} onClick={() => void changeMusic("POST")} className="flex-1 rounded-lg bg-indigo-500 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50">
-                {busy ? "Processing…" : clip.musicEnabled ? "Change music" : "Apply music"}
+              <button type="button" disabled={busy} onClick={() => void changeMusic("POST")} className="flex-1 rounded-lg bg-indigo-500 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50">
+                {busy ? "Processing…" : clip.musicEnabled ? "Change music" : "Add background music"}
               </button>
               {clip.musicEnabled ? <button type="button" disabled={busy} onClick={() => void changeMusic("DELETE")} className="rounded-lg border border-white/15 px-3 py-2 text-xs text-slate-200 disabled:opacity-50">Remove</button> : null}
             </div>
             {(musicError || clip.musicError) ? <p className="text-[11px] text-red-300">{musicError || clip.musicError}</p> : null}
-            <p className="text-[10px] leading-relaxed text-slate-500">Uses the retained rendered clip only. It does not restart transcription, AI selection, or rendering.</p>
+            {musicNote ? <p className="text-[10px] leading-relaxed text-indigo-300">{musicNote}</p> : null}
+            <p className="text-[10px] leading-relaxed text-slate-500">Uses the retained rendered clip only. It does not rerun transcription, AI analysis, clip selection, or source processing.</p>
           </div>
         ) : null}
 

@@ -135,6 +135,55 @@ export const jobMediaAssets = pgTable(
   ],
 );
 
+/**
+ * Music statuses for a B2 Music Library track.
+ * uploading → the object is being written to B2
+ * ready     → stored in B2 and probe metadata is available
+ * failed    → the upload or metadata probe failed (object is removed)
+ */
+export const MUSIC_TRACK_STATUSES = ["uploading", "ready", "failed"] as const;
+export type MusicTrackStatus = (typeof MUSIC_TRACK_STATUSES)[number];
+
+/**
+ * Permanent Music Library. Audio files live ONLY in Backblaze B2 under
+ * `music/{musicId}/{filename}`; this table is the metadata index used for
+ * search, AI selection (metadata only) and storage accounting.
+ */
+export const musicTracks = pgTable(
+  "music_tracks",
+  {
+    id: text("id").primaryKey(),
+    fileName: text("file_name").notNull(),
+    displayName: text("display_name").notNull(),
+    /** Durable B2 object key; never an R2 key. */
+    b2ObjectKey: text("b2_object_key").notNull().unique(),
+    contentType: text("content_type").notNull().default("audio/mpeg"),
+    fileSizeBytes: integer("file_size_bytes").notNull().default(0),
+    durationSec: real("duration_sec"),
+    mood: text("mood"),
+    energy: text("energy"), // low | medium | high
+    genre: text("genre"),
+    tags: jsonb("tags").$type<string[]>().notNull().default([]),
+    status: text("status").notNull().default("uploading"),
+    /** FFprobe output captured after upload (duration, codec, format, bitrate). */
+    audioMetadata: jsonb("audio_metadata").$type<{
+      durationSec: number;
+      formatName: string | null;
+      audioCodec: string | null;
+      sampleRate: number | null;
+      channels: number | null;
+      bitrate: number | null;
+    }>(),
+    error: text("error"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("music_tracks_status_idx").on(table.status),
+    index("music_tracks_created_at_idx").on(table.createdAt),
+  ],
+);
+
 export const clips = pgTable(
   "clips",
   {
@@ -158,6 +207,12 @@ export const clips = pgTable(
     /** Non-destructive post-render music state; originalObjectKey is never overwritten. */
     originalObjectKey: text("original_object_key"),
     musicAssetId: text("music_asset_id"),
+    /** B2 Music Library track used for this version (R2 media assets use musicAssetId). */
+    musicTrackId: text("music_track_id"),
+    /**
+     * R2 media-asset key only. B2 keys are never written here so R2 cleanup and
+     * the storage explorer can never confuse (or delete) B2 music objects.
+     */
     musicObjectKey: text("music_object_key"),
     musicVolume: real("music_volume"),
     musicEnabled: integer("music_enabled").notNull().default(0),
@@ -195,3 +250,4 @@ export type JobRow = typeof jobs.$inferSelect;
 export type MediaAssetRow = typeof mediaAssets.$inferSelect;
 export type ClipRow = typeof clips.$inferSelect;
 export type JobEventRow = typeof jobEvents.$inferSelect;
+export type MusicTrackRow = typeof musicTracks.$inferSelect;

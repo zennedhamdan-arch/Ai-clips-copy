@@ -16,6 +16,17 @@ services:
         value: /tmp/clipforge
       - key: MAX_CONCURRENT_JOBS
         value: "1"
+      # Music Library (Backblaze B2). Secrets are set in the Render dashboard.
+      - key: B2_ENDPOINT
+        value: https://s3.ca-east-006.backblazeb2.com
+      - key: B2_REGION
+        value: ca-east-006
+      - key: B2_MUSIC_BUCKET
+        value: clipforge-music
+      - key: B2_KEY_ID
+        sync: false
+      - key: B2_APPLICATION_KEY
+        sync: false
       - key: NODE_ENV
         value: production
 

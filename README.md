@@ -63,6 +63,15 @@ The health endpoint tests PostgreSQL, R2 bucket access, FFmpeg/FFprobe, provider
 
 No R2 CORS rule is required for V2 because browsers communicate with the same-origin API, not R2 directly.
 
+### 1b. Backblaze B2 (Music Library, optional)
+
+1. Create a Backblaze B2 bucket named **`clipforge-music`** in region `ca-east-006`
+   (or set `B2_REGION`/`B2_ENDPOINT`/`B2_MUSIC_BUCKET` to your own values). Keep it private.
+2. Create an **application key** scoped to that bucket with read and write access.
+3. Record the keyID (`B2_KEY_ID`) and applicationKey (`B2_APPLICATION_KEY`).
+4. The S3 endpoint for that region is `https://s3.ca-east-006.backblazeb2.com`.
+   No CORS rule is needed: the browser only ever calls the same-origin ClipForge API.
+
 ### 2. Render PostgreSQL
 
 Create a managed Render PostgreSQL database. Use its **internal** connection URL as `DATABASE_URL` when the app and database are in the same Render region. The included `render.yaml` can create and wire this database automatically.
@@ -74,8 +83,12 @@ Create a managed Render PostgreSQL database. Use its **internal** connection URL
 3. Choose a paid, always-on instance with at least **2 GB RAM** and enough CPU for FFmpeg. Do not configure autoscaling or multiple instances for V2.
 4. Add all secret environment variables listed below. Set `FRONTEND_URL` to the final `https://...onrender.com` URL.
 5. Deploy. Docker installs FFmpeg, Next.js builds, `npm start` runs migrations, then binds Next.js to `0.0.0.0:$PORT`.
-6. Open `/api/health`; confirm database, R2, FFmpeg, providers, and queue report ready.
-7. In the UI, run the FFmpeg self-test, then submit a short real video.
+6. Add the B2 variables if you use the Music Library (`B2_ENDPOINT`, `B2_REGION`,
+   `B2_KEY_ID`, `B2_APPLICATION_KEY`, `B2_MUSIC_BUCKET`). `render.yaml` ships the
+   non-secret values and marks both secrets `sync: false` so they stay in the dashboard.
+7. Open `/api/health`; confirm database, R2, FFmpeg, providers, queue and `b2Music` report ready.
+8. In the UI, run the FFmpeg self-test, then submit a short real video. Upload one MP3
+   at `/music-library` and confirm it appears with a duration.
 
 A Render persistent disk is **not needed**: `/tmp/clipforge` is disposable processing scratch space. Ensure the instance has enough ephemeral disk for one source, extracted audio, and one output clip.
 
@@ -97,6 +110,15 @@ Required on the Render web service (all are server-only; never prefix them with 
 | `R2_ENDPOINT` | `https://<ACCOUNT_ID>.r2.cloudflarestorage.com` |
 | `ADMIN_PASSWORD` | Strong password (12+ characters) for the server-only live R2 explorer |
 | `FRONTEND_URL` | Public Render application origin, no trailing slash |
+| `B2_ENDPOINT` | `https://s3.ca-east-006.backblazeb2.com` (Music Library only) |
+| `B2_REGION` | `ca-east-006` (must match the B2 bucket region) |
+| `B2_KEY_ID` | B2 application key ID with read/write on the music bucket |
+| `B2_APPLICATION_KEY` | B2 application key (server-only, never `NEXT_PUBLIC_`) |
+| `B2_MUSIC_BUCKET` | `clipforge-music` |
+
+The five `B2_*` values enable the optional Music Library. When they are missing every
+other ClipForge feature keeps working exactly as before; the Music Library simply
+reports "not configured".
 
 Recommended production settings:
 
@@ -180,6 +202,82 @@ Output format is selected before job creation and persisted on the job. Vertical
 - Mixing downloads the exact retained rendered clip and exact audio asset to `/tmp/clipforge`, validates both with FFprobe, loops/trims/fades the track, copies the video stream, uploads a unique MP4 key, and only then switches the database reference. Removal restores the retained no-music object.
 - **Apply music to all** processes each existing ready clip individually at the default 12% level.
 - `/admin/storage` is a live R2 inventory and exact-key database reconciliation view. Set `ADMIN_PASSWORD` (12+ characters) to enable its HttpOnly-cookie login. Orphans are diagnostic only; deletion is always confirmed, with stronger confirmation for referenced objects.
+
+## Music Library (Backblaze B2)
+
+ClipForge now has a **separate permanent Music Library** stored in Backblaze B2. It is
+completely independent from the Cloudflare R2 bucket that owns videos, sources, clips,
+posters and jobs.
+
+- **Storage layout:** `music/{musicId}/{filename}` inside `B2_MUSIC_BUCKET`.
+- **R2 is unchanged.** Existing R2 credentials, buckets, retention cleanup,
+  `sourceObjectKey` retry/resume logic and the live R2 explorer behave exactly as
+  before. R2 deletes refuse any `music/...` key, so cleanup can never remove B2 music.
+- **Credentials** (`B2_KEY_ID`, `B2_APPLICATION_KEY`) are read only by the server-side
+  client in `src/lib/b2.ts`; nothing is sent to the browser. Preview and playback go
+  through the same-origin route `/api/music/library/{id}/file`.
+
+### Using it
+
+1. Open **/music-library** and select one or more MP3/WAV/M4A/AAC/OGG files. Files are
+   uploaded with bounded concurrency (`MUSIC_UPLOAD_CONCURRENCY`, default 2) and stream
+   straight to B2, so several files are never buffered in memory at once.
+2. After each upload the server runs FFprobe on the stored object to capture duration,
+   codec, container format, sample rate, channels and bitrate, then marks the track
+   `ready`.
+3. Search/filter by name, mood, energy, genre or tag; preview inline; edit metadata; or
+   delete a track. The library listing and the B2 storage listing are both paginated and
+   never load the whole library into memory.
+4. Add optional `mood`, `energy`, `genre` and `tags` — they drive AI selection.
+
+### AI music selection
+
+- The AI receives **track metadata only** (name, mood, energy, genre, tags, duration)
+  plus the clip's title/hook/reason/score. No audio, object key or URL is ever sent.
+- If the AI call fails or returns an unusable id, selection falls back to deterministic
+  metadata matching (mood → genre → energy → tags, with a stable tie-break).
+- If nothing in the library matches, the clip is left exactly as it was: rendered
+  normally, **without** music.
+
+### Adding music to an existing clip
+
+`POST /api/clips/{id}/music` (or the "Add background music" control on a ready clip)
+accepts:
+
+| Body | Meaning |
+|---|---|
+| `{ "trackId": "music_…" }` | B2 Music Library track |
+| `{ "assetId": "asset_…" }` | legacy R2 Media Library asset (unchanged behaviour) |
+| `{ "auto": true }` | AI selection with deterministic fallback |
+| `{ "volume": 0.12 }` | music volume (5–50%, default 12%) |
+
+It **never** reruns transcription, AI analysis, clip selection or source processing.
+The retained rendered clip plus the selected music are mixed in `/tmp/clipforge`, the
+music is looped/trimmed to the clip duration with short fade-in/fade-out and ducked
+under speech, and the video stream is copied. The mixed MP4 is uploaded to R2 under a
+new key and only then does the database switch to it — the original clip stays live and
+downloadable until the new version is verified in R2. Temporary files are always
+removed.
+
+### Failure isolation
+
+Music is strictly optional. A missing bucket, bad B2 credentials or a failed mix can
+only affect the music request itself: the clip keeps its previous (or original) object
+key, `musicStatus` records the failure, and the normal video pipeline is untouched.
+
+### Verifying B2
+
+Sign in to `/admin/storage` (its Music storage section shows the B2 bucket, object
+count, total size, and a paginated list of object keys with size and last modified), or
+call the admin-only round trip:
+
+```bash
+curl -u anyuser:$ADMIN_PASSWORD -X POST https://<service>/api/admin/login
+curl -b cookies.txt https://<service>/api/admin/music/verify
+```
+
+It uploads a tiny throwaway object, verifies it with HEAD, downloads and compares it,
+lists the `music/` prefix, deletes it and confirms it is gone.
 
 ## Persistent Media Library
 

@@ -172,6 +172,9 @@ export async function runPipeline(jobId: string): Promise<void> {
         audioCodec: null,
         sizeBytes: job.fileSizeBytes ?? 0,
         bitrate: null,
+        formatName: null,
+        sampleRate: null,
+        channels: null,
       };
       console.info(`[job ${jobId}] stage=probing checkpoint=reused duration=${probe.durationSec} sourceObjectKey=${authoritativeSourceObjectKey ?? "none"}`);
     } else {

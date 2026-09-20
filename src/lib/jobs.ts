@@ -406,6 +406,7 @@ function mapClip(row: typeof clips.$inferSelect) {
     height: row.height,
     error: row.error,
     musicAssetId: row.musicAssetId,
+    musicTrackId: row.musicTrackId ?? null,
     musicVolume: row.musicVolume,
     musicEnabled: row.musicEnabled === 1,
     musicStatus: row.musicStatus,

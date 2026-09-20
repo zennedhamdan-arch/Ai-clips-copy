@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { requireAdmin } from "@/lib/admin-auth";
 import { AppError, toErrorPayload } from "@/lib/errors";
-import { listAllObjects, loadStorageReferences } from "@/lib/storage-admin";
+import { listAllObjects, listMusicStoragePage, loadStorageReferences } from "@/lib/storage-admin";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -17,7 +17,16 @@ export async function GET(request: Request) {
     const direction = url.searchParams.get("direction") === "desc" ? -1 : 1;
     const page = Math.max(1, Number(url.searchParams.get("page")) || 1);
     const pageSize = Math.max(10, Math.min(200, Number(url.searchParams.get("pageSize")) || 50));
-    const [objects, refs] = await Promise.all([listAllObjects(), loadStorageReferences()]);
+    const musicPage = Math.max(1, Number(url.searchParams.get("musicPage")) || 1);
+    const [objects, refs, music] = await Promise.all([
+      listAllObjects(),
+      loadStorageReferences(),
+      listMusicStoragePage({
+        page: musicPage,
+        pageSize: Number(url.searchParams.get("musicPageSize")) || 25,
+        query: url.searchParams.get("musicQuery"),
+      }),
+    ]);
     const totalSizeBytes = objects.reduce((sum, object) => sum + object.sizeBytes, 0);
     const prefixes = [...new Set(objects.flatMap((object) => {
       const parts = object.key.split("/").slice(0, -1);
@@ -37,6 +46,8 @@ export async function GET(request: Request) {
       refreshedAt: new Date().toISOString(), totalObjects: objects.length, totalSizeBytes, prefixes,
       filteredObjects: filtered.length, page, pageSize, pages: Math.max(1, Math.ceil(filtered.length / pageSize)),
       objects: filtered.slice(start, start + pageSize),
+      // Separate Backblaze B2 Music Library inventory (read-only, paginated).
+      music,
     });
   } catch (error) {
     const payload = toErrorPayload(error);

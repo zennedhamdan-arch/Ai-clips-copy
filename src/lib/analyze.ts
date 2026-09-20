@@ -1166,3 +1166,56 @@ export async function analyseTranscript(options: {
     discoveredCandidates: candidates.length,
   };
 }
+
+export type StructuredJsonResult = { content: string; provider: AnalysisProvider; model: string };
+
+/**
+ * Small structured-JSON request for non-transcript decisions such as picking
+ * background music from metadata. It reuses the existing provider order,
+ * global cooldowns and per-provider serialization, so it can never overload
+ * the same instance that is running clip analysis.
+ *
+ * Everything is best-effort for callers: catch the AppError and fall back.
+ */
+export async function requestStructuredJson(options: {
+  system: string;
+  user: string;
+  schema: Record<string, unknown>;
+  outputTokenLimit?: number;
+}): Promise<StructuredJsonResult> {
+  const outputTokenLimit = Math.max(128, Math.min(2_000, Math.round(options.outputTokenLimit ?? 400)));
+  const providers = configuredProviders(options.user, outputTokenLimit);
+  if (!providers.length) {
+    throw new AppError("invalid_ai_output", "No suitable AI provider is configured for this request.", {
+      status: 503,
+    });
+  }
+  const failures: string[] = [];
+  for (const provider of providers) {
+    const model = providerModel(provider);
+    try {
+      const content = await withProviderSlot(provider, () =>
+        callProvider({
+          provider,
+          system: options.system,
+          user: options.user,
+          mode: "json_object",
+          schema: options.schema,
+          outputTokenLimit,
+        }),
+      );
+      return { content, provider, model };
+    } catch (error) {
+      const message = error instanceof AppError
+        ? `${error.message}${error.detail ? ` — ${error.detail.slice(0, 200)}` : ""}`
+        : (error as Error).message;
+      failures.push(`${provider}/${model}: ${message}`);
+      console.warn(`[analysis] structured-json provider=${provider} model=${model} failed: ${message}`);
+    }
+  }
+  throw new AppError(
+    "invalid_ai_output",
+    `Every configured provider failed this request: ${failures.join(" | ").slice(0, 500)}`,
+    { status: 502 },
+  );
+}

@@ -33,6 +33,11 @@ export type ProbeResult = {
   audioCodec: string | null;
   sizeBytes: number;
   bitrate: number | null;
+  /** Container format reported by ffprobe (e.g. mp3, wav, mov,mp4). */
+  formatName: string | null;
+  /** Audio-only details used by the Music Library metadata probe. */
+  sampleRate: number | null;
+  channels: number | null;
 };
 
 function run(
@@ -159,9 +164,9 @@ export async function probeVideo(filePath: string): Promise<ProbeResult> {
       "-v",
       "error",
       "-show_entries",
-      "stream=index,codec_type,codec_name,width,height,avg_frame_rate,duration",
+      "stream=index,codec_type,codec_name,width,height,avg_frame_rate,duration,sample_rate,channels",
       "-show_entries",
-      "format=duration,size,bit_rate",
+      "format=duration,size,bit_rate,format_name",
       "-of",
       "json",
       filePath,
@@ -220,6 +225,9 @@ export async function probeVideo(filePath: string): Promise<ProbeResult> {
     audioCodec: audio?.codec_name ? String(audio.codec_name) : null,
     sizeBytes: stat.size,
     bitrate: parsed.format?.bit_rate ? Number(parsed.format.bit_rate) : null,
+    formatName: parsed.format?.format_name ? String(parsed.format.format_name) : null,
+    sampleRate: audio?.sample_rate ? Number(audio.sample_rate) : null,
+    channels: audio?.channels ? Number(audio.channels) : null,
   };
 }
 
