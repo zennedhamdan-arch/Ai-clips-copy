@@ -60,6 +60,14 @@ export async function GET() {
     checks.queue = `error: ${(error as Error).message}`;
   }
 
+  // Music Library (Backblaze B2) is optional: report it, never fail the app.
+  try {
+    const { b2Configured, checkB2 } = await import("@/lib/b2");
+    checks.b2Music = b2Configured() ? await checkB2() : "not configured (Music Library disabled)";
+  } catch (error) {
+    checks.b2Music = `error: ${(error as Error).message}`;
+  }
+
   return NextResponse.json(
     { status: ok ? "ok" : "degraded", checks, timestamp: new Date().toISOString() },
     { status: ok ? 200 : 503 },

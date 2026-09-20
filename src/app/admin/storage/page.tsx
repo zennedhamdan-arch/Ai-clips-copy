@@ -5,13 +5,16 @@ import { useCallback, useEffect, useState } from "react";
 
 type Ref = { type: string; id: string; field: string; label: string };
 type Item = { key: string; sizeBytes: number; lastModified: string | null; etag: string | null; referenced: boolean; references: Ref[] };
-type Listing = { refreshedAt: string; totalObjects: number; totalSizeBytes: number; filteredObjects: number; prefixes: string[]; page: number; pages: number; objects: Item[] };
+type Listing = { refreshedAt: string; totalObjects: number; totalSizeBytes: number; filteredObjects: number; prefixes: string[]; page: number; pages: number; objects: Item[]; music?: MusicListing };
+type MusicItem = { key: string; sizeBytes: number; lastModified: string | null; etag: string | null };
+type MusicListing = { provider: string; bucket: string; configured: boolean; error: string | null; objectCount: number; totalSizeBytes: number; page: number; pages: number; pageSize: number; truncated: boolean; objects: MusicItem[] };
 const bytes = (value: number) => value < 1024 ? `${value} B` : value < 1024 ** 2 ? `${(value / 1024).toFixed(1)} KB` : value < 1024 ** 3 ? `${(value / 1024 ** 2).toFixed(1)} MB` : `${(value / 1024 ** 3).toFixed(2)} GB`;
 
 export default function StorageAdminPage() {
   const [password, setPassword] = useState("");
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
   const [data, setData] = useState<Listing | null>(null);
+  const [musicPage, setMusicPage] = useState(1);
   const [query, setQuery] = useState("");
   const [prefix, setPrefix] = useState("");
   const [status, setStatus] = useState("all");
@@ -25,7 +28,7 @@ export default function StorageAdminPage() {
 
   const refresh = useCallback(async () => {
     setLoading(true); setError(null);
-    const params = new URLSearchParams({ q: query, prefix, status, sort, direction, page: String(page), pageSize: "50" });
+    const params = new URLSearchParams({ q: query, prefix, status, sort, direction, page: String(page), pageSize: "50", musicPage: String(musicPage), musicPageSize: "25" });
     try {
       const response = await fetch(`/api/admin/storage?${params}`, { cache: "no-store" });
       const result = await response.json() as Listing & { error?: string };
@@ -34,7 +37,9 @@ export default function StorageAdminPage() {
       setAuthenticated(true); setData(result);
     } catch (err) { setError((err as Error).message); }
     finally { setLoading(false); }
-  }, [query, prefix, status, sort, direction, page]);
+  }, [query, prefix, status, sort, direction, page, musicPage]);
+
+  const music = data?.music ?? null;
 
   useEffect(() => {
     const timer = window.setTimeout(() => void refresh(), 0);
@@ -66,6 +71,22 @@ export default function StorageAdminPage() {
       <section className="grid grid-cols-2 gap-3 sm:grid-cols-4">{[["Objects", data.totalObjects.toLocaleString()], ["Total size", bytes(data.totalSizeBytes)], ["Matching", data.filteredObjects.toLocaleString()], ["Refreshed", new Date(data.refreshedAt).toLocaleTimeString()]].map(([label,value]) => <div key={label} className="rounded-xl border border-white/10 bg-white/[0.03] p-4"><div className="text-[10px] uppercase text-slate-500">{label}</div><div className="mt-1 text-lg font-semibold">{value}</div></div>)}</section>
       <section className="grid gap-2 rounded-xl border border-white/10 bg-white/[0.03] p-3 sm:grid-cols-5"><input value={query} onChange={(e) => { setQuery(e.target.value); setPage(1); }} placeholder="Search exact key text…" className="rounded-lg bg-slate-950 p-2 text-xs sm:col-span-2"/><select value={prefix} onChange={(e) => { setPrefix(e.target.value === "(root)" ? "" : e.target.value); setPage(1); }} className="rounded-lg bg-slate-950 p-2 text-xs"><option value="">All prefixes</option>{data.prefixes.map((p) => <option key={p}>{p}</option>)}</select><select value={status} onChange={(e) => { setStatus(e.target.value); setPage(1); }} className="rounded-lg bg-slate-950 p-2 text-xs"><option value="all">All states</option><option value="referenced">Referenced</option><option value="orphaned">Orphaned</option></select><div className="flex gap-1"><select value={sort} onChange={(e) => setSort(e.target.value)} className="min-w-0 flex-1 rounded-lg bg-slate-950 p-2 text-xs"><option value="key">Key</option><option value="size">Size</option><option value="date">Modified</option></select><button onClick={() => setDirection(direction === "asc" ? "desc" : "asc")} className="rounded-lg border border-white/10 px-3 text-xs">{direction === "asc" ? "↑" : "↓"}</button></div></section>
       <div className="overflow-x-auto rounded-xl border border-white/10"><table className="w-full min-w-[800px] text-left text-xs"><thead className="bg-white/5 text-slate-400"><tr><th className="p-3">Exact R2 key</th><th>State</th><th>Size</th><th>Modified</th><th className="p-3">Actions</th></tr></thead><tbody>{data.objects.map((item) => <tr key={item.key} className="border-t border-white/5"><td className="max-w-xl break-all p-3 font-mono text-[11px]">{item.key}</td><td><span className={`rounded-full px-2 py-1 text-[10px] font-bold ${item.referenced ? "bg-emerald-500/15 text-emerald-300" : "bg-amber-500/15 text-amber-300"}`}>{item.referenced ? "REFERENCED" : "ORPHANED"}</span></td><td>{bytes(item.sizeBytes)}</td><td>{item.lastModified ? new Date(item.lastModified).toLocaleString() : "—"}</td><td className="p-3"><div className="flex gap-2"><button onClick={() => { setSelected(item); setConfirmation(""); }} className="text-indigo-300">Details</button><button onClick={() => void navigator.clipboard.writeText(item.key)} className="text-slate-300">Copy</button><a href={`/api/admin/storage/object?download=1&key=${encodeURIComponent(item.key)}`} className="text-slate-300">Download</a></div></td></tr>)}</tbody></table></div>
+      {music ? <section className="space-y-2 rounded-xl border border-indigo-400/20 bg-indigo-500/[0.04] p-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 className="text-sm font-semibold text-white">Music storage · Backblaze B2</h2>
+            <p className="text-[11px] text-slate-400">Bucket <span className="font-mono text-slate-300">{music.bucket}</span> · separate permanent music bucket · never touched by R2 cleanup</p>
+          </div>
+          <div className="flex gap-3 text-[11px] text-slate-300">
+            <span><span className="text-slate-500">Objects </span>{music.objectCount.toLocaleString()}{music.truncated ? "+" : ""}</span>
+            <span><span className="text-slate-500">Total size </span>{bytes(music.totalSizeBytes)}</span>
+          </div>
+        </div>
+        {music.error ? <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-2 text-[11px] text-amber-200">{music.error}</p> : null}
+        {music.objects.length ? <div className="overflow-x-auto rounded-lg border border-white/10"><table className="w-full min-w-[640px] text-left text-xs"><thead className="bg-white/5 text-slate-400"><tr><th className="p-2">B2 object key</th><th>Size</th><th>Last modified</th></tr></thead><tbody>{music.objects.map((item) => <tr key={item.key} className="border-t border-white/5"><td className="max-w-xl break-all p-2 font-mono text-[11px]">{item.key}</td><td>{bytes(item.sizeBytes)}</td><td>{item.lastModified ? new Date(item.lastModified).toLocaleString() : "—"}</td></tr>)}</tbody></table></div>
+          : <p className="rounded-lg border border-dashed border-white/10 p-3 text-center text-[11px] text-slate-500">{music.configured ? "No music objects in this bucket yet." : "B2 music storage is not configured."}</p>}
+        <div className="flex items-center justify-center gap-3 text-xs"><button disabled={musicPage <= 1} onClick={() => setMusicPage(musicPage - 1)} className="rounded border border-white/10 px-3 py-1.5 disabled:opacity-30">Previous</button><span>Page {(music.page ?? 1)} of {music.pages ?? 1}</span><button disabled={musicPage >= (music.pages ?? 1)} onClick={() => setMusicPage(musicPage + 1)} className="rounded border border-white/10 px-3 py-1.5 disabled:opacity-30">Next</button></div>
+      </section> : null}
       <div className="flex items-center justify-center gap-3 text-xs"><button disabled={page <= 1} onClick={() => setPage(page - 1)} className="rounded border border-white/10 px-3 py-2 disabled:opacity-30">Previous</button><span>Page {data.page} of {data.pages}</span><button disabled={page >= data.pages} onClick={() => setPage(page + 1)} className="rounded border border-white/10 px-3 py-2 disabled:opacity-30">Next</button></div>
     </> : <p className="text-sm text-slate-400">Loading live R2 inventory…</p>}
     {selected ? <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4"><div className="max-h-[90vh] w-full max-w-2xl overflow-auto rounded-2xl border border-white/10 bg-slate-950 p-5"><div className="flex justify-between"><h2 className="font-semibold">Object details</h2><button onClick={() => setSelected(null)}>✕</button></div><p className="mt-4 break-all font-mono text-xs">{selected.key}</p><p className="mt-2 text-xs text-slate-400">{bytes(selected.sizeBytes)} · ETag {selected.etag || "—"}</p><h3 className="mt-5 text-xs font-semibold">Database references</h3>{selected.references.length ? <ul className="mt-2 space-y-1">{selected.references.map((ref) => <li key={`${ref.type}-${ref.id}-${ref.field}`} className="rounded bg-white/5 p-2 text-xs">{ref.type} · {ref.label} · {ref.id} · {ref.field}</li>)}</ul> : <p className="mt-2 text-xs text-amber-300">ORPHANED is diagnostic only. Nothing is automatically deleted.</p>}<div className="mt-6 rounded-xl border border-red-500/30 bg-red-500/5 p-3"><p className="text-xs font-semibold text-red-200">Permanent R2 deletion</p><p className="mt-1 text-[11px] text-red-200/70">Database references are always preserved. {selected.referenced ? "This referenced object may break jobs, clips, or Media Library assets." : "This orphan has no current exact-key database reference."}</p><p className="mt-2 break-all text-[10px] text-slate-400">Type: {selected.referenced ? `DELETE REFERENCED ${selected.key}` : `DELETE ${selected.key}`}</p><input value={confirmation} onChange={(e) => setConfirmation(e.target.value)} className="mt-2 w-full rounded bg-black p-2 text-xs"/><button onClick={() => void removeObject()} className="mt-2 rounded bg-red-600 px-3 py-2 text-xs font-semibold">Delete permanently</button></div></div></div> : null}

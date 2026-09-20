@@ -14,6 +14,7 @@ import {
 import { Upload } from "@aws-sdk/lib-storage";
 import { config } from "./config";
 import { AppError } from "./errors";
+import { isB2MusicKey } from "./b2";
 
 let client: S3Client | null = null;
 
@@ -245,6 +246,13 @@ export async function objectExists(key: string): Promise<boolean> {
 }
 
 export async function deleteObject(key: string, reason = "unspecified"): Promise<void> {
+  // Hard isolation: Music Library objects live in Backblaze B2 under `music/`.
+  // Existing R2 cleanup must never be able to delete them, even if a key is
+  // ever passed here by mistake.
+  if (isB2MusicKey(key)) {
+    console.warn(`[R2 cleanup] key=${key} action=refused reason=b2-music-object-not-in-r2 (${reason})`);
+    return;
+  }
   try {
     await r2().send(new DeleteObjectCommand({ Bucket: config.r2BucketName, Key: key }));
     console.info(`[R2 cleanup] bucket=${config.r2BucketName} key=${key} action=deleted reason=${reason}`);
@@ -264,7 +272,7 @@ export async function deleteObjects(
   keys: Array<string | null | undefined>,
   reason = "unspecified",
 ): Promise<void> {
-  const uniqueKeys = [...new Set(keys.filter((key): key is string => Boolean(key)))];
+  const uniqueKeys = [...new Set(keys.filter((key): key is string => Boolean(key) && !isB2MusicKey(key)))];
   await Promise.all(uniqueKeys.map((key) => deleteObject(key, reason)));
 }
 

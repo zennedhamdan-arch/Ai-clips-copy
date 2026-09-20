@@ -136,6 +136,8 @@ export type ApiClip = {
   height: number | null;
   error: string | null;
   musicAssetId: string | null;
+  /** B2 Music Library track used for this version, when any. */
+  musicTrackId: string | null;
   musicVolume: number | null;
   musicEnabled: boolean;
   musicStatus: string;
