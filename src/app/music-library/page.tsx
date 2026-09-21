@@ -82,6 +82,8 @@ export default function MusicLibraryPage() {
   const [uploadGenre, setUploadGenre] = useState("");
   const [uploadTags, setUploadTags] = useState("");
   const [uploading, setUploading] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [syncNote, setSyncNote] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement | null>(null);
 
   const [editing, setEditing] = useState<string | null>(null);
@@ -182,6 +184,29 @@ export default function MusicLibraryPage() {
     await load();
   }, [limits, load, uploadEnergy, uploadGenre, uploadMood, uploadTags]);
 
+  /** Index music files that already exist in B2 (e.g. uploaded outside ClipForge). */
+  const syncFromB2 = useCallback(async () => {
+    setSyncing(true);
+    setSyncNote(null);
+    setError(null);
+    try {
+      const response = await fetch("/api/music/library/sync", { method: "POST" });
+      const data = (await response.json()) as {
+        error?: string; imported?: number; alreadyIndexed?: number; skippedMalformed?: number; failed?: number; truncated?: boolean;
+      };
+      if (!response.ok) throw new Error(data.error || "Could not sync the B2 library.");
+      const parts = [`${data.imported ?? 0} imported`, `${data.alreadyIndexed ?? 0} already indexed`];
+      if (data.skippedMalformed) parts.push(`${data.skippedMalformed} skipped`);
+      if (data.failed) parts.push(`${data.failed} failed`);
+      setSyncNote(`B2 sync finished: ${parts.join(" · ")}${data.truncated ? " (library truncated — sync again to continue)" : ""}.`);
+      await load();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSyncing(false);
+    }
+  }, [load]);
+
   const startEdit = (track: Track) => {
     setEditing(track.id);
     setDraft({
@@ -250,10 +275,24 @@ export default function MusicLibraryPage() {
       </header>
 
       <section className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
-        <h2 className="text-sm font-semibold text-white">Upload MP3s</h2>
-        <p className="mt-1 text-[11px] text-slate-500">
-          Select several files at once — they upload {limits?.uploadConcurrency ?? 2} at a time and stream straight to B2.
-        </p>
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h2 className="text-sm font-semibold text-white">Upload MP3s</h2>
+            <p className="mt-1 text-[11px] text-slate-500">
+              Select several files at once — they upload {limits?.uploadConcurrency ?? 2} at a time and stream straight to B2.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => void syncFromB2()}
+            disabled={syncing || (storage ? !storage.configured : true)}
+            title={storage && !storage.configured ? "Backblaze B2 is not configured." : "Index music files that already exist in B2 — no re-upload, no deletion."}
+            className="shrink-0 rounded-lg border border-indigo-400/30 bg-indigo-500/10 px-3 py-2 text-[11px] font-semibold text-indigo-300 hover:bg-indigo-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {syncing ? "Syncing…" : "Sync B2 Library"}
+          </button>
+        </div>
+        {syncNote ? <p className="mt-2 rounded-lg bg-emerald-500/10 px-3 py-2 text-[11px] text-emerald-300">{syncNote}</p> : null}
         <input
           ref={fileInput}
           type="file"

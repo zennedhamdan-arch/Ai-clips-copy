@@ -245,6 +245,25 @@ export async function objectExists(key: string): Promise<boolean> {
   return (await headObject(key)).exists;
 }
 
+/**
+ * Keys automatic R2 cleanup must never delete, even if a job/clip database
+ * column ever holds one:
+ *   - `music/*`         → Backblaze B2 Music Library objects. They never
+ *     exist in R2; refusing them here makes the R2↔B2 isolation hard.
+ *   - `media-library/*` → legacy Media Library audio assets (music and
+ *     sound effects). They are shared across jobs and outlive any single
+ *     job, so retention and job deletion must never remove them. Only the
+ *     Media Library's own delete operation (DELETE /api/media/{id}, which
+ *     calls the single-key deleteObject) may remove them.
+ *
+ * Job-owned one-off uploads under `pending-music/*` are intentionally NOT
+ * protected here: they belong to a single job and are cleaned up with it,
+ * exactly as before.
+ */
+export function isCleanupProtectedKey(key: string | null | undefined): boolean {
+  return isB2MusicKey(key) || (typeof key === "string" && key.startsWith("media-library/"));
+}
+
 export async function deleteObject(key: string, reason = "unspecified"): Promise<void> {
   // Hard isolation: Music Library objects live in Backblaze B2 under `music/`.
   // Existing R2 cleanup must never be able to delete them, even if a key is
@@ -268,12 +287,28 @@ export async function deleteObject(key: string, reason = "unspecified"): Promise
   }
 }
 
+/**
+ * Bulk delete used exclusively by cleanup paths (completed-job retention,
+ * deleteJob, the pending-music sweep). Unlike the single-key deleteObject,
+ * it never deletes music objects: B2 Music Library keys (`music/*`) and
+ * shared legacy Media Library assets (`media-library/*`) are skipped with a
+ * log line instead of being passed to R2, and skipping never throws, so the
+ * video/source/clip/poster cleanup still completes exactly as before.
+ */
 export async function deleteObjects(
   keys: Array<string | null | undefined>,
   reason = "unspecified",
 ): Promise<void> {
-  const uniqueKeys = [...new Set(keys.filter((key): key is string => Boolean(key) && !isB2MusicKey(key)))];
-  await Promise.all(uniqueKeys.map((key) => deleteObject(key, reason)));
+  const uniqueKeys = [...new Set(keys.filter((key): key is string => Boolean(key)))];
+  const deletable: string[] = [];
+  for (const key of uniqueKeys) {
+    if (isCleanupProtectedKey(key)) {
+      console.warn(`[R2 cleanup] key=${key} action=refused reason=cleanup-protected-music-object (${reason})`);
+      continue;
+    }
+    deletable.push(key);
+  }
+  await Promise.all(deletable.map((key) => deleteObject(key, reason)));
 }
 
 /** Remove browser-uploaded music that was never attached to a job. */
