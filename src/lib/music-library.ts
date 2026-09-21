@@ -1,6 +1,8 @@
+import path from "node:path";
 import { and, asc, count, desc, eq, ilike, inArray, or, sql, sum } from "drizzle-orm";
 import { getDb } from "@/db";
 import { clips, musicTracks, type MusicTrackRow, type MusicTrackStatus } from "@/db/schema";
+import { b2Configured, headB2Object, listB2ObjectsPage, MUSIC_KEY_PREFIX } from "./b2";
 import { config } from "./config";
 import { AppError } from "./errors";
 import { probeVideo } from "./ffmpeg";
@@ -393,4 +395,120 @@ export async function withMusicUploadSlot<T>(work: () => Promise<T>): Promise<T>
 
 export function newMusicId(): string {
   return `music_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
+}
+
+/* ------------------------------------------------------------------ */
+/* B2 library sync (index objects that are not in PostgreSQL yet)     */
+/* ------------------------------------------------------------------ */
+
+/** Safety valve so a manual sync can never walk an unbounded bucket. */
+const MAX_SYNC_WALK_PAGES = 500;
+
+export type MusicLibrarySyncResult = {
+  imported: number;
+  alreadyIndexed: number;
+  skippedMalformed: number;
+  failed: number;
+  totalObjects: number;
+  /** True when the walk stopped early at MAX_SYNC_WALK_PAGES. */
+  truncated: boolean;
+};
+
+/**
+ * Index B2 objects that are missing from the Music Library table.
+ *
+ * Read-only against B2 (List + Head only): no audio is downloaded into RAM,
+ * nothing is re-uploaded, nothing is deleted, and existing B2 object keys
+ * are preserved verbatim. Records already indexed by `b2_object_key` (a
+ * unique column) are never duplicated. Imported tracks receive safe
+ * defaults — status "ready" so the UI and Auto-match can use them
+ * immediately — and can be edited (name, mood, energy, genre, tags) later.
+ */
+export async function syncMusicLibraryFromB2(): Promise<MusicLibrarySyncResult> {
+  if (!b2Configured()) {
+    throw new AppError("internal", "Backblaze B2 music storage is not configured.", {
+      detail: "Set B2_ENDPOINT, B2_REGION, B2_KEY_ID, B2_APPLICATION_KEY and B2_MUSIC_BUCKET.",
+      status: 503,
+    });
+  }
+  const database = getDb();
+  const existing = await database.select({ key: musicTracks.b2ObjectKey, id: musicTracks.id }).from(musicTracks);
+  const indexedKeys = new Set(existing.map((row) => row.key));
+  const takenIds = new Set(existing.map((row) => row.id));
+
+  const result: MusicLibrarySyncResult = {
+    imported: 0,
+    alreadyIndexed: 0,
+    skippedMalformed: 0,
+    failed: 0,
+    totalObjects: 0,
+    truncated: false,
+  };
+
+  let token: string | null = null;
+  let pagesWalked = 0;
+  do {
+    const page = await listB2ObjectsPage({ prefix: MUSIC_KEY_PREFIX, continuationToken: token, maxKeys: 1000 });
+    pagesWalked += 1;
+    for (const object of page.objects) {
+      result.totalObjects += 1;
+      if (indexedKeys.has(object.key)) {
+        result.alreadyIndexed += 1;
+        continue;
+      }
+      // Expected shape is music/{musicId}/{filename}; a bare music/{filename}
+      // is still imported (with a generated id). Anything deeper or empty is
+      // skipped and counted, never guessed at.
+      const segments = object.key.slice(MUSIC_KEY_PREFIX.length).split("/").filter(Boolean);
+      if (segments.length < 1 || segments.length > 2) {
+        result.skippedMalformed += 1;
+        continue;
+      }
+      const fileName = segments[segments.length - 1];
+      const keySegment = segments.length === 2 ? segments[0] : null;
+      const id =
+        keySegment && /^[a-zA-Z0-9._-]{1,60}$/.test(keySegment) && !takenIds.has(keySegment)
+          ? keySegment
+          : newMusicId();
+      const extension = path.extname(fileName).toLowerCase();
+      const displayName = (path.basename(fileName, extension) || fileName).slice(0, 120);
+      try {
+        // HEAD only: authoritative size/content-type without downloading.
+        const head = await headB2Object(object.key);
+        if (!head.exists) {
+          result.failed += 1;
+          console.warn(`[music-sync] object missing between list and head key=${object.key}`);
+          continue;
+        }
+        await database.insert(musicTracks).values({
+          id,
+          fileName,
+          displayName,
+          b2ObjectKey: object.key,
+          contentType: head.contentType || "application/octet-stream",
+          fileSizeBytes: head.sizeBytes ?? object.sizeBytes,
+          durationSec: null,
+          mood: null,
+          energy: null,
+          genre: null,
+          tags: [],
+          status: "ready",
+          error: "Imported from B2 — duration and metadata not yet detected. Edit to add mood, energy, genre, or tags.",
+        });
+        indexedKeys.add(object.key);
+        takenIds.add(id);
+        result.imported += 1;
+        console.info(`[music-sync] imported key=${object.key} id=${id} size=${head.sizeBytes ?? "unknown"}`);
+      } catch (error) {
+        result.failed += 1;
+        console.warn(`[music-sync] import failed key=${object.key}: ${(error as Error).message}`);
+      }
+    }
+    token = page.nextToken;
+    if (token && pagesWalked >= MAX_SYNC_WALK_PAGES) {
+      result.truncated = true;
+      break;
+    }
+  } while (token);
+  return result;
 }
