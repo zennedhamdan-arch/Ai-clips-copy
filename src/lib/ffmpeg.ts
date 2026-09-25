@@ -662,24 +662,111 @@ export async function composeScene(options: {
   ], { capture: true, timeoutSec: Math.max(240, Math.round(duration * 10)) });
 }
 
-function escapeDrawText(text: string): string {
-  return text
-    .replace(/\\/g, "\\\\")
-    .replace(/'/g, "\u2019")
-    .replace(/[:%]/g, "")
+/**
+ * Escape arbitrary text for FFmpeg's `drawtext` `text` option.
+ *
+ * Two layers must be satisfied:
+ *   1. Filtergraph level — inside the -vf string the characters `'` (quote),
+ *      `\` (escape), `:` (option separator), `,` (filter separator), `;`
+ *      (filterchain separator) and `[`/`]` (link labels) are structural; each
+ *      occurrence is escaped with a backslash.
+ *   2. drawtext text expansion — a `%` starts a `%{...}` expansion, so a
+ *      literal percent must be doubled to `%%`.
+ *
+ * Newlines fold into spaces (card titles are single-line) and the text is
+ * truncated BEFORE escaping so an escape sequence can never be cut in half.
+ * Returns "" when nothing renderable remains — callers must then skip the
+ * drawtext filter entirely, because FFmpeg rejects an empty `text` value with
+ * "Either text, a valid file, a timecode or text source must be provided".
+ */
+export function escapeDrawText(raw: string | null | undefined, maxLength = 90): string {
+  if (typeof raw !== "string") return "";
+  const cleaned = raw
     .replace(/\r?\n/g, " ")
+    .replace(/\s+/g, " ")
     .trim()
-    .slice(0, 90);
+    .slice(0, maxLength)
+    .trim();
+  if (!cleaned) return "";
+  return cleaned
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\\'")
+    .replace(/:/g, "\\:")
+    .replace(/,/g, "\\,")
+    .replace(/;/g, "\\;")
+    .replace(/\[/g, "\\[")
+    .replace(/\]/g, "\\]")
+    .replace(/%/g, "%%");
 }
 
-function drawTextFontFile(): string | null {
+/**
+ * Build one fully-escaped `drawtext=...` filter from its parts (no raw
+ * interpolation of user text). Returns null when the text is empty so the
+ * caller never emits an invalid `text=` option. `fontFile` is included only
+ * when a verified path is provided (see drawTextFontFile).
+ */
+export function buildDrawTextFilter(options: {
+  text: string | null | undefined;
+  color: string;
+  size: number;
+  x: string;
+  y: string;
+  fontFile?: string | null;
+  maxLength?: number;
+}): string | null {
+  const text = escapeDrawText(options.text, options.maxLength);
+  if (!text) return null;
+  const parts: string[] = [];
+  if (options.fontFile) parts.push(`fontfile=${quoteFilterPath(options.fontFile)}`);
+  parts.push(`fontcolor=${options.color}`);
+  parts.push(`fontsize=${Math.max(1, Math.round(options.size))}`);
+  parts.push(`x=${options.x}`);
+  parts.push(`y=${options.y}`);
+  parts.push(`text=${text}`);
+  return `drawtext=${parts.join(":")}`;
+}
+
+/**
+ * Build the full -vf chain for a documentary scene card: optional title,
+ * optional subtitle, the CLIPFORGE watermark, and the fade in/out. Text
+ * filters are skipped entirely when their text is empty; the gradient input
+ * and encoding parameters stay in generateSceneCard.
+ */
+export function buildSceneCardVf(options: {
+  title: string | null | undefined;
+  subtitle?: string | null;
+  fontFile?: string | null;
+  durationSec: number;
+}): string {
+  const duration = Math.max(2, options.durationSec);
+  const filters: string[] = [];
+  const title = buildDrawTextFilter({ text: options.title, color: "white", size: 96, x: "(w-text_w)/2", y: "h*0.30", fontFile: options.fontFile });
+  if (title) filters.push(title);
+  const subtitle = buildDrawTextFilter({ text: options.subtitle, color: "white@0.8", size: 48, x: "(w-text_w)/2", y: "h*0.30+170", fontFile: options.fontFile });
+  if (subtitle) filters.push(subtitle);
+  const watermark = buildDrawTextFilter({ text: "CLIPFORGE DOCUMENTARY", color: "white@0.45", size: 34, x: "w-360", y: "h-170", fontFile: options.fontFile });
+  if (watermark) filters.push(watermark);
+  const fadeOutStart = Math.max(0, duration - 1);
+  filters.push(`fade=t=in:st=0:d=1.1`);
+  filters.push(`fade=t=out:st=${fadeOutStart.toFixed(3)}:d=${Math.min(1, duration / 3).toFixed(3)}`);
+  return filters.join(",");
+}
+
+/** First existing regular file among the known font candidates, else null. */
+export function drawTextFontFile(): string | null {
   const candidates = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
   ];
   for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) return candidate;
+    try {
+      // Verify it is a real regular file before referencing it via fontfile —
+      // a stale or directory path makes drawtext fail at runtime.
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+    } catch {
+      /* keep looking */
+    }
   }
   return null;
 }
@@ -694,7 +781,9 @@ function drawTextFontFile(): string | null {
 export async function generateSceneCard(options: {
   output: string;
   durationSec: number;
-  title: string;
+  /** May be empty/undefined (e.g. corrupted checkpoint) — the title filter is
+   *  then skipped instead of emitting invalid FFmpeg. */
+  title?: string | null;
   subtitle?: string | null;
   width?: number;
   height?: number;
@@ -706,23 +795,15 @@ export async function generateSceneCard(options: {
   const fps = options.fps ?? 30;
   const duration = Math.max(2, options.durationSec);
   const [c0, c1] = options.palette;
-  const font = drawTextFontFile();
-  const fontArgs = font ? `fontfile=${quoteFilterPath(font)},` : "";
-  const title = escapeDrawText(options.title);
-  const subtitle = options.subtitle ? escapeDrawText(options.subtitle) : "";
-  const drawTexts = [
-    `drawtext=${fontArgs}fontcolor=white:fontsize=96:x=(w-text_w)/2:y=h*0.30:text='${title.replace(/'/g, "")}'`,
-  ];
-  if (subtitle) {
-    drawTexts.push(`drawtext=${fontArgs}fontcolor=white@0.8:fontsize=48:x=(w-text_w)/2:y=h*0.30+170:text='${subtitle.replace(/'/g, "")}'`);
-  }
-  drawTexts.push(`drawtext=${fontArgs}fontcolor=white@0.45:fontsize=34:x=w-360:y=h-170:text='CLIPFORGE DOCUMENTARY'`);
-  const fadeOutStart = Math.max(0, duration - 1);
-  const vf = [
-    ...drawTexts,
-    `fade=t=in:st=0:d=1.1`,
-    `fade=t=out:st=${fadeOutStart.toFixed(3)}:d=${Math.min(1, duration / 3).toFixed(3)}`,
-  ].join(",");
+  // drawtext filters are built via buildSceneCardVf: user text is escaped,
+  // empty text is skipped entirely, and fontfile is only used when the font
+  // path was verified to exist.
+  const vf = buildSceneCardVf({
+    title: options.title,
+    subtitle: options.subtitle,
+    fontFile: drawTextFontFile(),
+    durationSec: duration,
+  });
   await run(ffmpegBin(), [
     "-hide_banner", "-loglevel", "error", "-y",
     "-f", "lavfi",
