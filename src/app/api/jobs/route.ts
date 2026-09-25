@@ -7,6 +7,8 @@ import { validatePublicVideoUrl } from "@/lib/url-safety";
 import { normalizeOutputFormat } from "@/lib/output-format";
 import { validateMusicReference } from "@/lib/music";
 import { deleteObject } from "@/lib/object-storage";
+import { assertTopic } from "@/lib/documentary-ai";
+import { normalizeJobMode } from "@/lib/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -18,13 +20,20 @@ export async function GET() {
   return NextResponse.json({ jobs });
 }
 
-/** Create a job from a direct media URL. */
+/**
+ * Create a job:
+ *   - mode "documentary"      → from an idea/topic (no video source)
+ *   - mode "movie_explainer"  → from a direct media URL
+ *   - mode "clips" (default)  → the original Video -> Shorts URL flow
+ */
 export async function POST(request: Request) {
   let pendingMusicKey: string | null = null;
   try {
     await ensureRuntime();
     const body = (await request.json().catch(() => ({}))) as {
       url?: string;
+      topic?: string;
+      topicText?: string;
       requestedClips?: number;
       maxClipSec?: number;
       subtitlesEnabled?: boolean;
@@ -35,7 +44,28 @@ export async function POST(request: Request) {
       mediaMode?: "none" | "manual" | "auto";
       musicAssetIds?: string[];
       soundEffectAssetIds?: string[];
+      mode?: string;
+      targetSec?: number;
     };
+
+    const mode = normalizeJobMode(body.mode);
+
+    if (mode === "documentary") {
+      const topic = assertTopic(body.topic);
+      const topicText = typeof body.topicText === "string" ? body.topicText.slice(0, 30_000) : null;
+      const jobId = await createJob({
+        sourceType: "idea",
+        sourceName: topic,
+        mode,
+        topic,
+        topicText,
+        targetSec: body.targetSec,
+        subtitlesEnabled: body.subtitlesEnabled,
+        outputFormat: normalizeOutputFormat(body.outputFormat),
+        mediaMode: body.mediaMode,
+      });
+      return NextResponse.json({ jobId }, { status: 202 });
+    }
 
     const url = (body.url ?? "").trim();
     if (!url) throw new AppError("bad_request", "Paste a video URL first.", { status: 400 });
@@ -61,6 +91,8 @@ export async function POST(request: Request) {
       mediaMode: body.mediaMode,
       musicAssetIds: body.musicAssetIds,
       soundEffectAssetIds: body.soundEffectAssetIds,
+      mode,
+      targetSec: body.targetSec,
     });
     pendingMusicKey = null;
 

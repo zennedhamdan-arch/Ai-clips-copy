@@ -2,15 +2,49 @@
 
 ClipForge turns a long video into captioned 9:16 clips. The existing mobile UI, upload/URL ingest, Groq transcription, AI selection, FFmpeg rendering, retries, progress polling, and downloads run in one long-running Next.js application.
 
+## The three creation modes
+
+The UI has a mode selector with three options:
+
+1. **Video → Shorts** (the original pipeline, unchanged). A movie/show/long video is
+   transcribed, analyzed for hook-worthy moments, and rendered into several captioned
+   9:16 clips with optional music.
+2. **Movie Explainer** (new). A movie or long video is probed and transcribed, then the
+   provider router performs *plot-level* understanding (characters, events,
+   relationships, cause/effect, plot progression). The AI picks the most interesting
+   thread and writes an **original** explainer script — Hook → Setup → What Happened →
+   Why It Matters → Payoff — in its own words. Relevant scenes are selected
+   deterministically from the story events (AI-suggested ranges are clamped to the
+   source and guaranteed to carry each narration line), narrated through the shared
+   audio layer, captioned per word, and mixed with optional background music into a
+   single finished 9:16 short. The result is commentary-driven, not a clip compiler.
+3. **Documentary** (new). A topic (plus optional pasted research material) is researched
+   through the same provider router, outlined, and written as an original script. The
+   script becomes a scene plan in which **every scene tracks its narration, duration,
+   visual prompt, required assets, captions, audio and generation status**. Scenes are
+   rendered as real video (animated visual cards generated with FFmpeg from each
+   visual prompt), narrated per scene through the shared audio layer, optionally
+   scored, and concatenated into one finished 9:16 documentary.
+
+Both new modes reuse the existing infrastructure end to end: the same PostgreSQL
+jobs/checkpoints, R2 storage, FFmpeg renderer, transcription, captions, retry routes,
+retention cleanup and single-worker queue. Checkpoints are per stage (and per
+section/scene for narration), so a retry only repeats failed work — successful
+transcripts, story analysis, scripts, scene assets and narration audio are reused.
+
 ## Production architecture
 
 ```text
 Browser ──HTTPS──> Render web service (Next.js UI + API + one in-process worker)
                          ├── PostgreSQL: jobs, progress, transcript, metadata
                          ├── Cloudflare R2: source videos, clips, poster frames
-                         ├── Gemini: direct long-transcript analysis
+                         ├── Gemini: direct long-transcript analysis (preferred)
                          ├── OpenRouter: analysis fallback
                          ├── Groq: Whisper transcription + smaller analysis fallback
+                         ├── NVIDIA NIM: ADDITIONAL OpenAI-compatible analysis provider
+                         ├── Shared audio layer (narration TTS + music/SFX):
+                         │     Gemini TTS → OpenAI-compatible TTS, music from the
+                         │     B2 Music Library → Free To Use, mock providers (test)
                          └── /tmp/clipforge: active-job scratch files only
                                       └── FFmpeg/FFprobe installed in Docker
 ```
@@ -46,9 +80,15 @@ Useful checks:
 ```bash
 npm run typecheck
 npm run lint
+npm test
 npm run build
 curl http://localhost:3000/api/health
 ```
+
+`npm test` runs the dependency-free Node test suite in `test/` (provider ordering,
+narration-duration estimates, audio router retry/fallback behavior with fakes,
+Free To Use scoring, deterministic scene selection, and the documentary fallbacks).
+It needs no database, network, or FFmpeg.
 
 The health endpoint tests PostgreSQL, R2 bucket access, FFmpeg/FFprobe, provider configuration, temporary storage, and queue startup. The UI's FFmpeg self-test remains available.
 
@@ -103,6 +143,7 @@ Required on the Render web service (all are server-only; never prefix them with 
 | `GEMINI_API_KEY` | Google AI Studio key for direct Gemini analysis (preferred for long videos) |
 | `GEMINI_TEXT_MODEL` | A Gemini model ID currently available to that API account |
 | `OPENROUTER_API_KEY` | OpenRouter analysis fallback key (optional) |
+| `NVIDIA_API_KEY` / `NVIDIA_TEXT_MODEL` | Additional NVIDIA NIM analysis provider (optional) |
 | `R2_ACCOUNT_ID` | Cloudflare account ID |
 | `R2_ACCESS_KEY_ID` | R2 token access key ID |
 | `R2_SECRET_ACCESS_KEY` | R2 token secret |
@@ -164,6 +205,59 @@ Timestamped transcript segments are split primarily by a conservative token esti
 The backend trims overlong descriptive fields, repairs common JSON wrappers, validates real segment indexes/timestamps, removes overlap, and selects final clips globally. One request per provider/model is allowed at a time; Groq requests are additionally paced against `ANALYSIS_GROQ_TOKENS_PER_MINUTE`. HTTP 429 honors `Retry-After` with exponential backoff and jitter, while OpenRouter 402 and model 404 responses enter a provider cooldown instead of being hammered repeatedly.
 
 Prepared transcript parts, each part's successful candidates/provider attempts, and final selection are persisted in `jobs.analysis_checkpoint`. A retry reuses the saved transcript and successful parts and processes only incomplete parts. Selected clip rows are idempotent render checkpoints: ready R2 outputs are reused, while failed or missing outputs alone are rendered again. Video data is never sent to an analysis model.
+
+### NVIDIA (additional provider)
+
+NVIDIA NIM is an **additional** OpenAI-compatible analysis provider — it is not the
+foundation and nothing in the pipelines is built around it. It is used only when
+`ANALYSIS_PROVIDERS` lists `nvidia` **and** both `NVIDIA_API_KEY` and
+`NVIDIA_TEXT_MODEL` are set. The canonical fallback order is fixed by the app
+(gemini → openrouter → groq → nvidia); the environment list only decides which
+providers are enabled.
+
+```env
+NVIDIA_API_KEY=
+NVIDIA_TEXT_MODEL=meta/llama-3.3-70b-instruct
+NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+ANALYSIS_PROVIDERS=gemini,openrouter,groq,nvidia
+```
+
+## Shared audio layer (narration + music)
+
+The Movie Explainer and Documentary modes share a provider-agnostic audio layer
+(`src/lib/audio/`):
+
+* **Narration (TTS).** `AUDIO_TTS_PROVIDERS` orders the narration providers
+  (default `gemini,openai`). Gemini TTS reuses `GEMINI_API_KEY`/`GEMINI_BASE_URL`
+  (`TTS_GEMINI_MODEL`, `TTS_GEMINI_VOICE`); OpenAI-compatible TTS uses the documented
+  `POST {OPENAI_TTS_BASE_URL}/audio/speech` endpoint with `OPENAI_API_KEY`,
+  `OPENAI_TTS_MODEL`, `OPENAI_TTS_VOICE`. Each provider gets up to 2 attempts with
+  bounded exponential backoff for transient failures (429/5xx/network/malformed
+  output); non-transient failures skip to the next provider. Every generated file is
+  ffprobe-verified before use. If every provider fails the job fails at the
+  `narration` stage and a retry resumes exactly there.
+* **Music/SFX.** `AUDIO_MUSIC_PROVIDERS` orders the music providers
+  (default `b2,freetouse`). `b2` reuses the existing Backblaze B2 Music Library
+  (AI metadata selection, then deterministic fallback); `freetouse` uses the public
+  **Free To Use** music API (`FREETOUSE_BASE_URL`, no API key required) — it searches
+  non-premium tracks matching the job topic, downloads `files.mp3` with a size cap,
+  and ffprobe-verifies it. **Music is optional**: when no provider can supply a track
+  the job still renders, without music, instead of failing.
+* **Mock providers.** With `AUDIO_MOCK=1` and `mock` in the provider lists, offline
+  deterministic providers (sine-tone narration, fixed-tone music) are enabled for
+  local end-to-end testing without any API keys.
+
+| Variable | Purpose |
+|---|---|
+| `AUDIO_TTS_PROVIDERS` | Narration provider order (`gemini,openai[,mock]`) |
+| `AUDIO_MUSIC_PROVIDERS` | Music provider order (`b2,freetouse[,mock]`) |
+| `AUDIO_MOCK` | `1` enables the offline mock providers (testing only) |
+| `TTS_GEMINI_MODEL` / `TTS_GEMINI_VOICE` | Gemini TTS model/voice |
+| `OPENAI_API_KEY` / `OPENAI_TTS_BASE_URL` / `OPENAI_TTS_MODEL` / `OPENAI_TTS_VOICE` | OpenAI-compatible TTS |
+| `FREETOUSE_BASE_URL` | Free To Use music API base (default `https://api.freetouse.com/v3`) |
+| `AUDIO_REQUEST_TIMEOUT_SEC` | Per-provider audio request timeout (default 180) |
+| `MOVIE_TARGET_SEC` | Default Movie Explainer target length (default 90) |
+| `DOC_TARGET_SEC` | Default Documentary target length (default 120) |
 
 ## Database migrations
 

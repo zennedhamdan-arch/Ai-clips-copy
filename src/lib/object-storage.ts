@@ -311,6 +311,33 @@ export async function deleteObjects(
   await Promise.all(deletable.map((key) => deleteObject(key, reason)));
 }
 
+/**
+ * Safety-net cleanup for job-owned R2 objects (narration audio, generated
+ * scene assets, final outputs under jobs/{jobId}/). Specific keys (source,
+ * clips, posters) are always deleted by name first; this sweep removes any
+ * other job-scoped objects so retention and job deletion never leak files.
+ * Bounded: at most `maxPages` list pages.
+ */
+export async function deleteJobPrefix(jobId: string, reason = "job-cleanup", maxPages = 10): Promise<number> {
+  const prefix = `jobs/${jobId}/`;
+  let continuationToken: string | undefined;
+  let removed = 0;
+  let pages = 0;
+  do {
+    const page = await r2().send(new ListObjectsV2Command({
+      Bucket: config.r2BucketName,
+      Prefix: prefix,
+      ContinuationToken: continuationToken,
+    }));
+    pages += 1;
+    const keys = (page.Contents ?? []).map((item) => item.Key).filter(Boolean);
+    await deleteObjects(keys, reason);
+    removed += keys.length;
+    continuationToken = page.IsTruncated ? page.NextContinuationToken ?? undefined : undefined;
+  } while (continuationToken && pages < maxPages);
+  return removed;
+}
+
 /** Remove browser-uploaded music that was never attached to a job. */
 export async function deletePendingMusicOlderThan(cutoff: Date, protectedKeys: ReadonlySet<string> = new Set()): Promise<number> {
   let continuationToken: string | undefined;

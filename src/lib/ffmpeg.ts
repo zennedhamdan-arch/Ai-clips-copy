@@ -526,6 +526,217 @@ function fontsDir(): string {
   return "/usr/share/fonts";
 }
 
+/**
+ * Transcode any decoded audio (WAV/L16/FLAC/MP3) to 44.1kHz stereo MP3.
+ * Used to normalize narration files so every job stores one consistent format.
+ */
+export async function transcodeAudio(options: { input: string; output: string; bitrateK?: number }): Promise<void> {
+  await run(ffmpegBin(), [
+    "-hide_banner", "-loglevel", "error", "-y",
+    "-i", options.input,
+    "-c:a", "libmp3lame", "-b:a", `${options.bitrateK ?? 128}k`, "-ar", "44100", "-ac", "2",
+    options.output,
+  ], { capture: true, timeoutSec: 300 });
+}
+
+/**
+ * Concatenate same-encoding segments losslessly (concat demuxer + -c copy).
+ * All segments must share codec/resolution/fps — the pipelines produce them
+ * with identical render settings.
+ */
+export async function concatVideos(options: { inputs: string[]; output: string; listFile: string }): Promise<void> {
+  if (!options.inputs.length) throw new AppError("ffmpeg_error", "No segments were provided for concatenation.");
+  const list = options.inputs.map((input) => `file '${input.replace(/'/g, "'\\''")}'`).join("\n");
+  await fsp.writeFile(options.listFile, `${list}\n`, "utf8");
+  await run(ffmpegBin(), [
+    "-hide_banner", "-loglevel", "error", "-y",
+    "-f", "concat", "-safe", "0", "-i", options.listFile,
+    "-c", "copy",
+    options.output,
+  ], { capture: true, timeoutSec: 900 });
+}
+
+/**
+ * Final mix for narrated videos (Movie Explainer / Documentary): the body
+ * video stream is COPIED (no re-encode — cheap on the small Render instance)
+ * while narration parts are delayed to their section offsets and optionally
+ * ducked under a background music bed.
+ */
+export async function composeFinalShort(options: {
+  body: string;
+  output: string;
+  durationSec: number;
+  narrationParts: Array<{ input: string; startSec: number }>;
+  music?: { input: string; volume?: number } | null;
+  onProgress?: (ratio: number) => void;
+}): Promise<void> {
+  const duration = Math.max(0.5, options.durationSec);
+  const args: string[] = ["-hide_banner", "-loglevel", "warning", "-stats", "-y", "-i", options.body];
+  for (const part of options.narrationParts) args.push("-i", part.input);
+  let musicIndex: number | null = null;
+  if (options.music) {
+    musicIndex = 1 + options.narrationParts.length;
+    args.push("-stream_loop", "-1", "-i", options.music.input);
+  }
+
+  const filters: string[] = [];
+  const mixInputs: string[] = [];
+  options.narrationParts.forEach((part, index) => {
+    const inputIndex = 1 + index;
+    const delayMs = Math.round(Math.max(0, part.startSec) * 1000);
+    filters.push(
+      `[${inputIndex}:a]aresample=44100,asetpts=PTS-STARTPTS,adelay=${delayMs}:all=1[narr${index}]`,
+    );
+    mixInputs.push(`[narr${index}]`);
+  });
+  if (musicIndex !== null && options.music) {
+    const volume = Math.max(0.03, Math.min(0.4, options.music.volume ?? 0.16));
+    const fadeOutStart = Math.max(0, duration - 1.2);
+    filters.push(
+      `[${musicIndex}:a]aresample=44100,atrim=duration=${duration.toFixed(3)},asetpts=PTS-STARTPTS,volume=${volume.toFixed(3)},afade=t=in:st=0:d=0.8,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=${Math.min(1.2, duration).toFixed(3)}[music]`,
+    );
+    mixInputs.push("[music]");
+  }
+  if (!mixInputs.length) {
+    // Video-only fallback (should not happen for narrated pipelines).
+    args.push("-c", "copy", options.output);
+    await run(ffmpegBin(), args, { timeoutSec: 300 });
+    return;
+  }
+  filters.push(
+    `${mixInputs.join("")}amix=inputs=${mixInputs.length}:duration=first:dropout_transition=2:normalize=0,alimiter=limit=0.95[aout]`,
+  );
+  args.push(
+    "-filter_complex", filters.join(";"),
+    "-map", "0:v", "-map", "[aout]",
+    "-t", duration.toFixed(3),
+    "-c:v", "copy",
+    "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+    "-movflags", "+faststart",
+    options.output,
+  );
+  await run(ffmpegBin(), args, {
+    timeoutSec: Math.max(300, Math.round(duration * 6)),
+    onStderr: (chunk) => {
+      if (!options.onProgress) return;
+      for (const match of chunk.matchAll(/time=(\d+):(\d+):(\d+\.\d+)/g)) {
+        const seconds = Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+        options.onProgress(Math.min(1, seconds / duration));
+      }
+    },
+  });
+}
+
+/**
+ * Documentary scene composite: pad/trim the generated scene card to the exact
+ * scene duration (freezing the last frame if the narration ran longer) and
+ * mix the narration in. Re-encodes once — the card is a cheap gradient source.
+ */
+export async function composeScene(options: {
+  card: string;
+  cardDurationSec: number;
+  narration: string;
+  output: string;
+  finalDurationSec: number;
+  crf?: number;
+  preset?: string;
+}): Promise<void> {
+  const duration = Math.max(0.5, options.finalDurationSec);
+  const cloneDuration = Math.max(0, duration - (options.cardDurationSec || 0) - 0.05);
+  const filters = [
+    `[0:v]tpad=stop_mode=clone:stop_duration=${cloneDuration.toFixed(3)},trim=duration=${duration.toFixed(3)},setpts=PTS-STARTPTS,setsar=1[v]`,
+    `[1:a]aresample=44100,asetpts=PTS-STARTPTS,apad,atrim=duration=${duration.toFixed(3)}[a]`,
+  ].join(";");
+  await run(ffmpegBin(), [
+    "-hide_banner", "-loglevel", "error", "-y",
+    "-i", options.card,
+    "-i", options.narration,
+    "-filter_complex", filters,
+    "-map", "[v]", "-map", "[a]",
+    "-t", duration.toFixed(3),
+    "-c:v", "libx264", "-preset", options.preset ?? "veryfast", "-crf", String(options.crf ?? 23),
+    "-pix_fmt", "yuv420p", "-profile:v", "high",
+    "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+    "-movflags", "+faststart",
+    options.output,
+  ], { capture: true, timeoutSec: Math.max(240, Math.round(duration * 10)) });
+}
+
+function escapeDrawText(text: string): string {
+  return text
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\u2019")
+    .replace(/[:%]/g, "")
+    .replace(/\r?\n/g, " ")
+    .trim()
+    .slice(0, 90);
+}
+
+function drawTextFontFile(): string | null {
+  const candidates = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Generate a documentary scene visual entirely with FFmpeg (no external image
+ * API): an animated gradient canvas plus title text, derived deterministically
+ * from the scene's visual prompt. This is the "procedural" asset generator —
+ * the scene's visualPrompt is persisted so a real image provider can replace
+ * it later without touching the pipeline.
+ */
+export async function generateSceneCard(options: {
+  output: string;
+  durationSec: number;
+  title: string;
+  subtitle?: string | null;
+  width?: number;
+  height?: number;
+  fps?: number;
+  palette: [string, string];
+}): Promise<void> {
+  const width = options.width ?? 1080;
+  const height = options.height ?? 1920;
+  const fps = options.fps ?? 30;
+  const duration = Math.max(2, options.durationSec);
+  const [c0, c1] = options.palette;
+  const font = drawTextFontFile();
+  const fontArgs = font ? `fontfile=${quoteFilterPath(font)},` : "";
+  const title = escapeDrawText(options.title);
+  const subtitle = options.subtitle ? escapeDrawText(options.subtitle) : "";
+  const drawTexts = [
+    `drawtext=${fontArgs}fontcolor=white:fontsize=96:x=(w-text_w)/2:y=h*0.30:text='${title.replace(/'/g, "")}'`,
+  ];
+  if (subtitle) {
+    drawTexts.push(`drawtext=${fontArgs}fontcolor=white@0.8:fontsize=48:x=(w-text_w)/2:y=h*0.30+170:text='${subtitle.replace(/'/g, "")}'`);
+  }
+  drawTexts.push(`drawtext=${fontArgs}fontcolor=white@0.45:fontsize=34:x=w-360:y=h-170:text='CLIPFORGE DOCUMENTARY'`);
+  const fadeOutStart = Math.max(0, duration - 1);
+  const vf = [
+    ...drawTexts,
+    `fade=t=in:st=0:d=1.1`,
+    `fade=t=out:st=${fadeOutStart.toFixed(3)}:d=${Math.min(1, duration / 3).toFixed(3)}`,
+  ].join(",");
+  await run(ffmpegBin(), [
+    "-hide_banner", "-loglevel", "error", "-y",
+    "-f", "lavfi",
+    "-i", `gradients=s=${width}x${height}:d=${duration.toFixed(3)}:c0=${c0}:c1=${c1}:x0=0:y0=0:x1=${width}:y1=${height}:nb_colors=2:type=linear:speed=0.04`,
+    "-vf", vf,
+    "-t", duration.toFixed(3),
+    "-r", String(fps),
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+    "-pix_fmt", "yuv420p", "-profile:v", "high",
+    "-movflags", "+faststart",
+    options.output,
+  ], { capture: true, timeoutSec: Math.max(240, Math.round(duration * 10)) });
+}
+
 /** Pull a still frame so the UI can show a poster for each clip. */
 export async function extractPoster(options: {
   input: string;

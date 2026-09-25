@@ -271,7 +271,16 @@ type ResponseMode = "json_schema" | "json_object";
 
 function providerModel(provider: AnalysisProvider): string {
   if (provider === "gemini") return config.geminiTextModel;
-  return provider === "openrouter" ? config.openrouterTextModel : config.groqTextModel;
+  if (provider === "openrouter") return config.openrouterTextModel;
+  if (provider === "nvidia") return config.nvidiaTextModel;
+  return config.groqTextModel;
+}
+
+function providerLabel(provider: AnalysisProvider): string {
+  if (provider === "gemini") return "Gemini";
+  if (provider === "openrouter") return "OpenRouter";
+  if (provider === "nvidia") return "NVIDIA";
+  return "Groq";
 }
 
 type ProviderRuntimeState = {
@@ -348,8 +357,16 @@ function retryAfterMilliseconds(response: Response): number | undefined {
   return Number.isFinite(date) ? Math.max(0, date - Date.now()) : undefined;
 }
 
+type OpenAiCompatibleProvider = "groq" | "openrouter" | "nvidia";
+
+function openAiCompatibleEndpoint(provider: OpenAiCompatibleProvider): { baseUrl: string; key: string } {
+  if (provider === "groq") return { baseUrl: config.groqBaseUrl, key: config.groqApiKey };
+  if (provider === "nvidia") return { baseUrl: config.nvidiaBaseUrl, key: config.nvidiaApiKey };
+  return { baseUrl: config.openrouterBaseUrl, key: config.openrouterApiKey };
+}
+
 async function callOpenAiCompatible(options: {
-  provider: "groq" | "openrouter";
+  provider: OpenAiCompatibleProvider;
   system: string;
   user: string;
   mode: ResponseMode;
@@ -358,14 +375,17 @@ async function callOpenAiCompatible(options: {
   signal: AbortSignal;
 }): Promise<string> {
   const isGroq = options.provider === "groq";
-  const baseUrl = isGroq ? config.groqBaseUrl : config.openrouterBaseUrl;
-  const key = isGroq ? config.groqApiKey : config.openrouterApiKey;
+  const isNvidia = options.provider === "nvidia";
+  const { baseUrl, key } = openAiCompatibleEndpoint(options.provider);
+  // NVIDIA NIM supports OpenAI chat completions with json_object, but not the
+  // strict json_schema envelope, so it always uses the looser mode.
+  const effectiveMode: ResponseMode = isNvidia ? "json_object" : options.mode;
   const body = {
     model: providerModel(options.provider),
     temperature: 0.2,
     max_tokens: options.outputTokenLimit,
     messages: [{ role: "system", content: options.system }, { role: "user", content: options.user }],
-    response_format: options.mode === "json_schema"
+    response_format: effectiveMode === "json_schema"
       ? { type: "json_schema", json_schema: { name: "analysis_result", strict: true, schema: options.schema } }
       : { type: "json_object" },
   };
@@ -374,7 +394,7 @@ async function callOpenAiCompatible(options: {
     headers: {
       Authorization: `Bearer ${key}`,
       "Content-Type": "application/json",
-      ...(isGroq ? {} : {
+      ...(isGroq || isNvidia ? {} : {
         "HTTP-Referer": process.env.OPENROUTER_SITE_URL?.trim() || config.frontendUrl || "https://clipforge.local",
         "X-Title": process.env.OPENROUTER_SITE_NAME?.trim() || "ClipForge",
       }),
@@ -384,8 +404,8 @@ async function callOpenAiCompatible(options: {
   });
   if (!response.ok) {
     const text = await response.text().catch(() => "");
-    if (response.status === 400 && options.mode === "json_schema") {
-      throw new AppError("invalid_ai_output", `${isGroq ? "Groq" : "OpenRouter"} rejected strict structured output.`, {
+    if (response.status === 400 && effectiveMode === "json_schema") {
+      throw new AppError("invalid_ai_output", `${providerLabel(options.provider)} rejected strict structured output.`, {
         detail: text.slice(0, 400),
         status: 502,
         retryable: true,
@@ -393,14 +413,14 @@ async function callOpenAiCompatible(options: {
     }
     throw describeHttpStatus(
       response.status,
-      `${isGroq ? "Groq" : "OpenRouter"} analysis`,
+      `${providerLabel(options.provider)} analysis`,
       text,
       retryAfterMilliseconds(response),
     );
   }
   const parsed = await response.json() as { choices?: Array<{ message?: { content?: string | null } }> };
   const content = parsed.choices?.[0]?.message?.content;
-  if (!content) throw new AppError("invalid_ai_output", `${isGroq ? "Groq" : "OpenRouter"} returned an empty response.`, { retryable: true });
+  if (!content) throw new AppError("invalid_ai_output", `${providerLabel(options.provider)} returned an empty response.`, { retryable: true });
   return content;
 }
 
@@ -471,7 +491,7 @@ async function callProvider(options: {
   try {
     return await (options.provider === "gemini"
       ? callGemini({ ...options, signal: controller.signal })
-      : callOpenAiCompatible({ ...options, provider: options.provider, signal: controller.signal }));
+      : callOpenAiCompatible({ ...options, provider: options.provider as OpenAiCompatibleProvider, signal: controller.signal }));
   } catch (error) {
     if ((error as Error).name === "AbortError") {
       throw new AppError("invalid_ai_output", `${options.provider} analysis timed out.`, { retryable: true });

@@ -11,6 +11,7 @@ export type ErrorKind =
   | "disk_full"
   | "interrupted"
   | "no_clips"
+  | "audio_error"
   | "bad_request"
   | "not_found"
   | "internal";
@@ -23,11 +24,17 @@ export class AppError extends Error {
   /** Original upstream HTTP status, retained server-side for retry policy. */
   providerStatus?: number;
   retryAfterMs?: number;
+  /**
+   * Stage the pipeline should park the job at when this error is "paused and
+   * retryable" (for example a 429 during narration). Retry resumes from the
+   * earliest incomplete checkpoint, so the stage only labels the UI.
+   */
+  resumeStage?: string;
 
   constructor(
     kind: ErrorKind,
     message: string,
-    options: { detail?: string; status?: number; retryable?: boolean; providerStatus?: number; retryAfterMs?: number } = {},
+    options: { detail?: string; status?: number; retryable?: boolean; providerStatus?: number; retryAfterMs?: number; resumeStage?: string } = {},
   ) {
     super(message);
     this.name = "AppError";
@@ -37,6 +44,7 @@ export class AppError extends Error {
     this.retryable = options.retryable ?? false;
     this.providerStatus = options.providerStatus;
     this.retryAfterMs = options.retryAfterMs;
+    this.resumeStage = options.resumeStage;
   }
 }
 

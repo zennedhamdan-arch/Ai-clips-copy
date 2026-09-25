@@ -7,6 +7,7 @@
     "start": "npm run db:migrate && next start -H 0.0.0.0",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --no-warnings --import ./test/register.mjs --test test/*.test.ts",
     "db:migrate": "node scripts/migrate.mjs",
     "db:generate": "drizzle-kit generate"
   },
