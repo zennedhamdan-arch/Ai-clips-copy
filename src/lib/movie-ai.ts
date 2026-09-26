@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { AppError } from "./errors";
-import { extractJson, requestStructuredJson, splitTranscriptForAnalysis } from "./analyze";
+import { extractJson, requestStructuredJson, splitTranscriptForAnalysis, type CallProviderOverride, type StructuredJsonAttemptInfo } from "./analyze";
 import { estimateNarrationDurationSec } from "./audio/router";
 import type {
   ExplainerScript,
@@ -49,6 +49,8 @@ function storyChunkSchema() {
     arc: z.string().trim().max(400).optional(),
   });
 }
+
+type StoryChunkParsed = z.infer<ReturnType<typeof storyChunkSchema>>;
 
 function storySignature(transcript: Transcript): string {
   return [
@@ -144,6 +146,8 @@ export async function analyzeStory(options: {
   checkpoint?: StoryAnalysisCheckpoint | null;
   onCheckpoint?: (checkpoint: StoryAnalysisCheckpoint) => void | Promise<void>;
   onProgress?: (completed: number, total: number, message: string) => void | Promise<void>;
+  /** Test hook: replaces the AI provider call (never set in production). */
+  callOverride?: CallProviderOverride;
 }): Promise<{ characters: StoryCharacter[]; events: StoryEvent[]; arc: string; provider: string; model: string }> {
   const { transcript } = options;
   const signature = storySignature(transcript);
@@ -198,28 +202,12 @@ export async function analyzeStory(options: {
     const suppliedStart = suppliedIndexes.length ? Math.min(...suppliedIndexes) : chunk.startSegment;
     const suppliedEnd = suppliedIndexes.length ? Math.max(...suppliedIndexes) : chunk.endSegment;
 
-    let partEvents: StoryEvent[] = [];
-    let partCharacters: StoryCharacter[] = [];
-    let partArc = "";
-    let partProvider = "";
-    let partModel = "";
-    try {
-      // Bounded retry: one correction round for malformed AI JSON, with the
-      // provider router (Gemini → OpenRouter → Groq → NVIDIA) inside it.
-      const { value: parsedValue, provider, model } = await requestStructuredJsonWithRepair({
-        system: STORY_SYSTEM,
-        user: prompt,
-        schema,
-        outputTokenLimit: 1_400,
-        jobId: options.jobId,
-        label: `story part ${chunk.index + 1}`,
-      });
-      const parsed = storyChunkSchema().parse(parsedValue);
-      // S indexes in the prompt are absolute segment indexes; clamp anything
-      // out of range into the supplied window so a sloppy model cannot reach
-      // another chunk.
-      const segmentAt = (index: number) => transcript.segments[Math.max(suppliedStart, Math.min(suppliedEnd, Math.round(index)))];
-      partEvents = (parsed.events ?? [])
+    // S indexes in the prompt are absolute segment indexes; clamp anything
+    // out of range into the supplied window so a sloppy model cannot reach
+    // another chunk.
+    const segmentAt = (index: number) => transcript.segments[Math.max(suppliedStart, Math.min(suppliedEnd, Math.round(index)))];
+    const mapStoryEvents = (parsed: StoryChunkParsed): StoryEvent[] =>
+      (parsed.events ?? [])
         .map((raw) => {
           const start = segmentAt(raw.startSegment);
           const end = segmentAt(raw.endSegment);
@@ -237,6 +225,60 @@ export async function analyzeStory(options: {
         })
         .filter((event): event is StoryEvent => Boolean(event))
         .filter((event) => event.startSec >= chunk.startSec - 1 && event.endSec <= chunk.endSec + 1);
+
+    // Final acceptance gate for this part: the provider response must pass
+    // the story schema AND yield at least one event with usable segment
+    // indexes. Anything else (HTTP 200 with a top-level array, NaN segments,
+    // unparseable JSON, …) fails the attempt and the router continues with
+    // the next provider — a provider is never "successful" just because its
+    // response parsed as JSON.
+    const validateStoryPart = (value: unknown): unknown => {
+      const parsed = storyChunkSchema().parse(value);
+      if (!mapStoryEvents(parsed).length) {
+        // The schema accepted the payload but no event maps to a valid,
+        // forward-going segment range — semantically invalid, not success.
+        throw new AppError("invalid_ai_output", "Story part produced no usable events (invalid or missing segment indexes).", {
+          reason: "invalid_segment",
+          retryable: true,
+        });
+      }
+      return value;
+    };
+
+    // Per-attempt attribution: exactly which provider/model produced each
+    // pass/fail for this part.
+    let partAttempt = 0;
+    const onAttempt = ({ provider, model, outcome, reason }: StructuredJsonAttemptInfo) => {
+      partAttempt += 1;
+      const prefix = `[story] job=${options.jobId ?? "unknown"} part=${chunk.index + 1}/${chunks.length} provider=${provider} model=${model} attempt=${partAttempt}`;
+      if (outcome === "passed") console.info(`${prefix} validation=passed`);
+      else console.warn(`${prefix} validation=failed reason=${reason ?? "unknown"}`);
+    };
+
+    let partProvider = "";
+    let partModel = "";
+    let partEvents: StoryEvent[] = [];
+    let partCharacters: StoryCharacter[] = [];
+    let partArc = "";
+    try {
+      // Provider fallback on FINAL schema validation (strict json_schema on
+      // the first pass where supported), plus one bounded repair round for
+      // malformed JSON. Providers are tried sequentially.
+      const { value: parsedValue, provider, model } = await requestStructuredJsonWithRepair({
+        system: STORY_SYSTEM,
+        user: prompt,
+        schema,
+        outputTokenLimit: 1_400,
+        jobId: options.jobId,
+        label: `story part ${chunk.index + 1}`,
+        validate: validateStoryPart,
+        onAttempt,
+        strictFirstAttempt: true,
+        callOverride: options.callOverride,
+      });
+      // The value already passed validateStoryPart; map it to events.
+      const parsed = storyChunkSchema().parse(parsedValue);
+      partEvents = mapStoryEvents(parsed);
       partCharacters = (parsed.characters ?? []).map((character) => ({
         name: character.name,
         role: (character.role ?? "unknown").toLowerCase(),
@@ -312,7 +354,14 @@ export type StructuredJsonRepairResult = {
   model: string;
 };
 
-/** requestStructuredJson plus one bounded repair round for malformed JSON. */
+/**
+ * requestStructuredJson plus one bounded repair round. Provider fallback is
+ * driven by FINAL validation: with `validate`, a provider is accepted only
+ * when its extracted JSON passes the application schema — HTTP 200, parseable
+ * JSON or a top-level array are not success. Each pass tries the configured
+ * providers sequentially; pass 1 uses strict json_schema where the provider
+ * supports it (when `strictFirstAttempt`), the repair pass uses json_object.
+ */
 export async function requestStructuredJsonWithRepair(options: {
   system: string;
   user: string;
@@ -320,21 +369,34 @@ export async function requestStructuredJsonWithRepair(options: {
   outputTokenLimit?: number;
   jobId?: string;
   label?: string;
+  /** Final acceptance gate applied to every provider response. */
+  validate?: (value: unknown) => unknown;
+  /** Per-attempt attribution hook (provider/model/outcome/reason). */
+  onAttempt?: (info: StructuredJsonAttemptInfo) => void;
+  /** Use strict json_schema on pass 1 (providers without support fall back
+   *  to json_object automatically). Default false preserves prior callers. */
+  strictFirstAttempt?: boolean;
+  /** Test hook: replaces the real provider call (never set in production). */
+  callOverride?: CallProviderOverride;
 }): Promise<StructuredJsonRepairResult> {
-  const run = async (user: string): Promise<StructuredJsonRepairResult> => {
+  const run = async (user: string, pass: number): Promise<StructuredJsonRepairResult> => {
     const result = await requestStructuredJson({
       system: options.system,
       user,
       schema: options.schema,
       outputTokenLimit: options.outputTokenLimit,
+      mode: options.strictFirstAttempt && pass === 1 ? "json_schema" : "json_object",
+      validate: options.validate,
+      onAttempt: options.onAttempt,
+      callOverride: options.callOverride,
     });
     return { value: extractJson(result.content), provider: result.provider, model: result.model };
   };
   try {
-    return await run(options.user);
+    return await run(options.user, 1);
   } catch (firstError) {
     console.warn(`[ai-json] job=${options.jobId ?? "unknown"} ${options.label ?? "request"} first attempt failed: ${(firstError as Error).message.slice(0, 200)}; retrying with repair instruction`);
-    return run(`${options.user}\n\nCORRECTION: Your previous response was not usable. Return ONLY one complete valid JSON object that exactly matches the requested shape — no markdown, no trailing commas, no text outside the JSON.`);
+    return run(`${options.user}\n\nCORRECTION: Your previous response was not usable. Return ONLY one complete valid JSON object that exactly matches the requested shape — no markdown, no trailing commas, no text outside the JSON.`, 2);
   }
 }
 

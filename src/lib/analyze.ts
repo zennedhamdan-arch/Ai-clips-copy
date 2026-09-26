@@ -267,7 +267,22 @@ const selectionJsonSchema = {
   },
 };
 
-type ResponseMode = "json_schema" | "json_object";
+export type ResponseMode = "json_schema" | "json_object";
+
+/** Test hook: replaces the real provider call (see requestStructuredJson). */
+export type CallProviderOverride = (
+  provider: AnalysisProvider,
+  input: { system: string; user: string; mode: ResponseMode; schema: Record<string, unknown>; outputTokenLimit: number },
+) => Promise<string>;
+
+/** One provider attempt outcome, for per-attempt attribution logging. */
+export type StructuredJsonAttemptInfo = {
+  provider: AnalysisProvider;
+  model: string;
+  outcome: "passed" | "failed";
+  /** "http_503" | "http_429" | "invalid_json" | "schema_validation" | "invalid_segment" | "timeout" | … */
+  reason?: string;
+};
 
 function providerModel(provider: AnalysisProvider): string {
   if (provider === "gemini") return config.geminiTextModel;
@@ -494,7 +509,7 @@ async function callProvider(options: {
       : callOpenAiCompatible({ ...options, provider: options.provider as OpenAiCompatibleProvider, signal: controller.signal }));
   } catch (error) {
     if ((error as Error).name === "AbortError") {
-      throw new AppError("invalid_ai_output", `${options.provider} analysis timed out.`, { retryable: true });
+      throw new AppError("invalid_ai_output", `${options.provider} analysis timed out.`, { retryable: true, reason: "timeout" });
     }
     throw error;
   } finally {
@@ -1189,11 +1204,32 @@ export async function analyseTranscript(options: {
 
 export type StructuredJsonResult = { content: string; provider: AnalysisProvider; model: string };
 
+/** Derive a short machine-readable reason for a failed provider attempt. */
+function attemptFailureReason(error: unknown): string {
+  if (error instanceof AppError) {
+    if (error.reason) return error.reason;
+    if (typeof error.providerStatus === "number" && error.providerStatus >= 400) return `http_${error.providerStatus}`;
+  }
+  const name = (error as Error)?.name ?? "";
+  if (name === "TimeoutError" || name === "AbortError") return "timeout";
+  if (name === "ZodError") return "schema_validation";
+  if (name === "SyntaxError") return "invalid_json";
+  return "request_failed";
+}
+
 /**
  * Small structured-JSON request for non-transcript decisions such as picking
- * background music from metadata. It reuses the existing provider order,
- * global cooldowns and per-provider serialization, so it can never overload
- * the same instance that is running clip analysis.
+ * background music from metadata or the Movie Explainer story parts. It
+ * reuses the existing provider order (ANALYSIS_PROVIDERS), global cooldowns
+ * and per-provider serialization, so it can never overload the same instance
+ * that is running clip analysis.
+ *
+ * A provider attempt is SUCCESSFUL only when it returns content that (when
+ * `validate` is provided) extracts as JSON AND passes `validate`. HTTP 200
+ * with malformed JSON, a top-level array where an object is expected, or a
+ * semantically invalid payload all fail the attempt and fall through to the
+ * next configured provider — the same behavior as the discovery fallback
+ * flow. Providers are tried sequentially, never in parallel.
  *
  * Everything is best-effort for callers: catch the AppError and fall back.
  */
@@ -1202,8 +1238,21 @@ export async function requestStructuredJson(options: {
   user: string;
   schema: Record<string, unknown>;
   outputTokenLimit?: number;
+  /** json_schema (strict) where supported, json_object otherwise/on repair. */
+  mode?: ResponseMode;
+  /**
+   * Final acceptance gate: the extracted JSON must pass this validator or the
+   * provider attempt fails and the next provider is tried. A response is
+   * never accepted merely because JSON.parse succeeded.
+   */
+  validate?: (value: unknown) => unknown;
+  /** Per-attempt attribution hook (provider/model/outcome/reason). */
+  onAttempt?: (info: StructuredJsonAttemptInfo) => void;
+  /** Test hook: replaces the real provider call (never set in production). */
+  callOverride?: CallProviderOverride;
 }): Promise<StructuredJsonResult> {
   const outputTokenLimit = Math.max(128, Math.min(2_000, Math.round(options.outputTokenLimit ?? 400)));
+  const mode = options.mode ?? "json_object";
   const providers = configuredProviders(options.user, outputTokenLimit);
   if (!providers.length) {
     throw new AppError("invalid_ai_output", "No suitable AI provider is configured for this request.", {
@@ -1213,24 +1262,34 @@ export async function requestStructuredJson(options: {
   const failures: string[] = [];
   for (const provider of providers) {
     const model = providerModel(provider);
+    const callInput = { system: options.system, user: options.user, mode, schema: options.schema, outputTokenLimit };
     try {
-      const content = await withProviderSlot(provider, () =>
-        callProvider({
-          provider,
-          system: options.system,
-          user: options.user,
-          mode: "json_object",
-          schema: options.schema,
-          outputTokenLimit,
-        }),
-      );
+      const content = options.callOverride
+        ? await options.callOverride(provider, callInput)
+        : await withProviderSlot(provider, () => callProvider({ provider, ...callInput }));
+      if (options.validate) {
+        try {
+          options.validate(extractJson(content));
+        } catch (error) {
+          const reason = error instanceof AppError ? (error.reason ?? "schema_validation") : attemptFailureReason(error);
+          const message = error instanceof AppError || error instanceof Error ? error.message : String(error);
+          options.onAttempt?.({ provider, model, outcome: "failed", reason });
+          failures.push(`${provider}/${model}: ${reason}: ${message.slice(0, 200)}`);
+          console.warn(`[analysis] structured-json provider=${provider} model=${model} rejected reason=${reason} detail=${message.slice(0, 300)}`);
+          continue; // not successful → try the next provider
+        }
+      }
+      options.onAttempt?.({ provider, model, outcome: "passed" });
       return { content, provider, model };
     } catch (error) {
-      const message = error instanceof AppError
-        ? `${error.message}${error.detail ? ` — ${error.detail.slice(0, 200)}` : ""}`
-        : (error as Error).message;
-      failures.push(`${provider}/${model}: ${message}`);
-      console.warn(`[analysis] structured-json provider=${provider} model=${model} failed: ${message}`);
+      const appError = error instanceof AppError ? error : new AppError("invalid_ai_output", (error as Error).message, { retryable: true });
+      const reason = attemptFailureReason(error);
+      const message = `${appError.message}${appError.detail ? ` — ${appError.detail.slice(0, 200)}` : ""}`;
+      options.onAttempt?.({ provider, model, outcome: "failed", reason });
+      failures.push(`${provider}/${model}: ${reason}: ${message}`);
+      console.warn(`[analysis] structured-json provider=${provider} model=${model} failed reason=${reason} detail=${message}`);
+      if (appError.providerStatus === 429) setProviderCooldown(provider, Math.max(1_000, appError.retryAfterMs ?? 0));
+      if (appError.providerStatus === 401 || appError.providerStatus === 403) blockProvider(provider, 5 * 60_000);
     }
   }
   throw new AppError(

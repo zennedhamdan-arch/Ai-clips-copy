@@ -211,9 +211,10 @@ Prepared transcript parts, each part's successful candidates/provider attempts, 
 NVIDIA NIM is an **additional** OpenAI-compatible analysis provider — it is not the
 foundation and nothing in the pipelines is built around it. It is used only when
 `ANALYSIS_PROVIDERS` lists `nvidia` **and** both `NVIDIA_API_KEY` and
-`NVIDIA_TEXT_MODEL` are set. The canonical fallback order is fixed by the app
-(gemini → openrouter → groq → nvidia); the environment list only decides which
-providers are enabled.
+`NVIDIA_TEXT_MODEL` are set. `ANALYSIS_PROVIDERS` sets the **exact fallback
+order** — providers are tried in that order (unconfigured providers are
+skipped), e.g. `ANALYSIS_PROVIDERS=gemini,groq,openrouter,nvidia` tries Gemini
+first, then Groq, then OpenRouter, then NVIDIA.
 
 ```env
 NVIDIA_API_KEY=

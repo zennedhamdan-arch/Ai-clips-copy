@@ -25,6 +25,12 @@ export class AppError extends Error {
   providerStatus?: number;
   retryAfterMs?: number;
   /**
+   * Short machine-readable failure reason for per-attempt logging
+   * (e.g. "http_503", "invalid_json", "schema_validation", "invalid_segment",
+   * "timeout").
+   */
+  reason?: string;
+  /**
    * Stage the pipeline should park the job at when this error is "paused and
    * retryable" (for example a 429 during narration). Retry resumes from the
    * earliest incomplete checkpoint, so the stage only labels the UI.
@@ -34,7 +40,7 @@ export class AppError extends Error {
   constructor(
     kind: ErrorKind,
     message: string,
-    options: { detail?: string; status?: number; retryable?: boolean; providerStatus?: number; retryAfterMs?: number; resumeStage?: string } = {},
+    options: { detail?: string; status?: number; retryable?: boolean; providerStatus?: number; retryAfterMs?: number; resumeStage?: string; reason?: string } = {},
   ) {
     super(message);
     this.name = "AppError";
@@ -45,6 +51,7 @@ export class AppError extends Error {
     this.providerStatus = options.providerStatus;
     this.retryAfterMs = options.retryAfterMs;
     this.resumeStage = options.resumeStage;
+    this.reason = options.reason;
   }
 }
 

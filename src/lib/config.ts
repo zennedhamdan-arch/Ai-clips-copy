@@ -180,11 +180,19 @@ export type AnalysisProvider = "gemini" | "openrouter" | "groq" | "nvidia";
  * is enforced by providersConfigured, not by the list order.
  */
 export function parseAnalysisProviderList(raw: string): AnalysisProvider[] {
-  // The fallback ORDER is canonical (gemini → openrouter → groq → nvidia);
-  // the environment list only decides which providers are enabled.
-  const valid: AnalysisProvider[] = ["gemini", "openrouter", "groq", "nvidia"];
-  const enabled = new Set(raw.split(",").map((p) => p.trim().toLowerCase()));
-  return valid.filter((provider) => enabled.has(provider));
+  // ANALYSIS_PROVIDERS controls the fallback ORDER: the list is honored
+  // exactly as written (trimmed, lowercased, deduped); unknown entries are
+  // dropped. Providers that are not configured are still skipped at request
+  // time by providersConfigured().
+  const valid = new Set<AnalysisProvider>(["gemini", "openrouter", "groq", "nvidia"]);
+  const order: AnalysisProvider[] = [];
+  const seen = new Set<AnalysisProvider>();
+  for (const entry of raw.split(",").map((p) => p.trim().toLowerCase())) {
+    if (!entry || !valid.has(entry as AnalysisProvider) || seen.has(entry as AnalysisProvider)) continue;
+    seen.add(entry as AnalysisProvider);
+    order.push(entry as AnalysisProvider);
+  }
+  return order;
 }
 
 export type AudioTtsProviderId = "gemini" | "openai" | "mock";
@@ -214,12 +222,9 @@ export function providersConfigured(): {
     openrouter: config.openrouterApiKey.length > 0 && config.openrouterTextModel.length > 0,
     nvidia: config.nvidiaApiKey.length > 0 && config.nvidiaTextModel.length > 0,
   };
-  // Keep fallback deterministic even when an older deployment still has
-  // ANALYSIS_PROVIDERS=groq,openrouter. A configured direct Gemini key is
-  // always enabled and preferred; the env list can still disable fallbacks.
-  const enabled = new Set<AnalysisProvider>(config.analysisProviders);
-  if (configured.gemini) enabled.add("gemini");
-  const order = (["gemini", "openrouter", "groq", "nvidia"] as AnalysisProvider[])
-    .filter((provider) => enabled.has(provider) && configured[provider]);
+  // ANALYSIS_PROVIDERS sets the exact fallback order. Only providers that are
+  // BOTH listed and configured are used; everything else is skipped (and
+  // temporary unavailability is handled at request time by the router).
+  const order = config.analysisProviders.filter((provider) => configured[provider]);
   return { ...configured, order };
 }
