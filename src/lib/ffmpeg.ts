@@ -526,6 +526,298 @@ function fontsDir(): string {
   return "/usr/share/fonts";
 }
 
+/**
+ * Transcode any decoded audio (WAV/L16/FLAC/MP3) to 44.1kHz stereo MP3.
+ * Used to normalize narration files so every job stores one consistent format.
+ */
+export async function transcodeAudio(options: { input: string; output: string; bitrateK?: number }): Promise<void> {
+  await run(ffmpegBin(), [
+    "-hide_banner", "-loglevel", "error", "-y",
+    "-i", options.input,
+    "-c:a", "libmp3lame", "-b:a", `${options.bitrateK ?? 128}k`, "-ar", "44100", "-ac", "2",
+    options.output,
+  ], { capture: true, timeoutSec: 300 });
+}
+
+/**
+ * Concatenate same-encoding segments losslessly (concat demuxer + -c copy).
+ * All segments must share codec/resolution/fps — the pipelines produce them
+ * with identical render settings.
+ */
+export async function concatVideos(options: { inputs: string[]; output: string; listFile: string }): Promise<void> {
+  if (!options.inputs.length) throw new AppError("ffmpeg_error", "No segments were provided for concatenation.");
+  const list = options.inputs.map((input) => `file '${input.replace(/'/g, "'\\''")}'`).join("\n");
+  await fsp.writeFile(options.listFile, `${list}\n`, "utf8");
+  await run(ffmpegBin(), [
+    "-hide_banner", "-loglevel", "error", "-y",
+    "-f", "concat", "-safe", "0", "-i", options.listFile,
+    "-c", "copy",
+    options.output,
+  ], { capture: true, timeoutSec: 900 });
+}
+
+/**
+ * Final mix for narrated videos (Movie Explainer / Documentary): the body
+ * video stream is COPIED (no re-encode — cheap on the small Render instance)
+ * while narration parts are delayed to their section offsets and optionally
+ * ducked under a background music bed.
+ */
+export async function composeFinalShort(options: {
+  body: string;
+  output: string;
+  durationSec: number;
+  narrationParts: Array<{ input: string; startSec: number }>;
+  music?: { input: string; volume?: number } | null;
+  onProgress?: (ratio: number) => void;
+}): Promise<void> {
+  const duration = Math.max(0.5, options.durationSec);
+  const args: string[] = ["-hide_banner", "-loglevel", "warning", "-stats", "-y", "-i", options.body];
+  for (const part of options.narrationParts) args.push("-i", part.input);
+  let musicIndex: number | null = null;
+  if (options.music) {
+    musicIndex = 1 + options.narrationParts.length;
+    args.push("-stream_loop", "-1", "-i", options.music.input);
+  }
+
+  const filters: string[] = [];
+  const mixInputs: string[] = [];
+  options.narrationParts.forEach((part, index) => {
+    const inputIndex = 1 + index;
+    const delayMs = Math.round(Math.max(0, part.startSec) * 1000);
+    filters.push(
+      `[${inputIndex}:a]aresample=44100,asetpts=PTS-STARTPTS,adelay=${delayMs}:all=1[narr${index}]`,
+    );
+    mixInputs.push(`[narr${index}]`);
+  });
+  if (musicIndex !== null && options.music) {
+    const volume = Math.max(0.03, Math.min(0.4, options.music.volume ?? 0.16));
+    const fadeOutStart = Math.max(0, duration - 1.2);
+    filters.push(
+      `[${musicIndex}:a]aresample=44100,atrim=duration=${duration.toFixed(3)},asetpts=PTS-STARTPTS,volume=${volume.toFixed(3)},afade=t=in:st=0:d=0.8,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=${Math.min(1.2, duration).toFixed(3)}[music]`,
+    );
+    mixInputs.push("[music]");
+  }
+  if (!mixInputs.length) {
+    // Video-only fallback (should not happen for narrated pipelines).
+    args.push("-c", "copy", options.output);
+    await run(ffmpegBin(), args, { timeoutSec: 300 });
+    return;
+  }
+  filters.push(
+    `${mixInputs.join("")}amix=inputs=${mixInputs.length}:duration=first:dropout_transition=2:normalize=0,alimiter=limit=0.95[aout]`,
+  );
+  args.push(
+    "-filter_complex", filters.join(";"),
+    "-map", "0:v", "-map", "[aout]",
+    "-t", duration.toFixed(3),
+    "-c:v", "copy",
+    "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+    "-movflags", "+faststart",
+    options.output,
+  );
+  await run(ffmpegBin(), args, {
+    timeoutSec: Math.max(300, Math.round(duration * 6)),
+    onStderr: (chunk) => {
+      if (!options.onProgress) return;
+      for (const match of chunk.matchAll(/time=(\d+):(\d+):(\d+\.\d+)/g)) {
+        const seconds = Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+        options.onProgress(Math.min(1, seconds / duration));
+      }
+    },
+  });
+}
+
+/**
+ * Documentary scene composite: pad/trim the generated scene card to the exact
+ * scene duration (freezing the last frame if the narration ran longer) and
+ * mix the narration in. Re-encodes once — the card is a cheap gradient source.
+ */
+export async function composeScene(options: {
+  card: string;
+  cardDurationSec: number;
+  narration: string;
+  output: string;
+  finalDurationSec: number;
+  crf?: number;
+  preset?: string;
+}): Promise<void> {
+  const duration = Math.max(0.5, options.finalDurationSec);
+  const cloneDuration = Math.max(0, duration - (options.cardDurationSec || 0) - 0.05);
+  const filters = [
+    `[0:v]tpad=stop_mode=clone:stop_duration=${cloneDuration.toFixed(3)},trim=duration=${duration.toFixed(3)},setpts=PTS-STARTPTS,setsar=1[v]`,
+    `[1:a]aresample=44100,asetpts=PTS-STARTPTS,apad,atrim=duration=${duration.toFixed(3)}[a]`,
+  ].join(";");
+  await run(ffmpegBin(), [
+    "-hide_banner", "-loglevel", "error", "-y",
+    "-i", options.card,
+    "-i", options.narration,
+    "-filter_complex", filters,
+    "-map", "[v]", "-map", "[a]",
+    "-t", duration.toFixed(3),
+    "-c:v", "libx264", "-preset", options.preset ?? "veryfast", "-crf", String(options.crf ?? 23),
+    "-pix_fmt", "yuv420p", "-profile:v", "high",
+    "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+    "-movflags", "+faststart",
+    options.output,
+  ], { capture: true, timeoutSec: Math.max(240, Math.round(duration * 10)) });
+}
+
+/**
+ * Escape arbitrary text for FFmpeg's `drawtext` `text` option.
+ *
+ * Two layers must be satisfied:
+ *   1. Filtergraph level — inside the -vf string the characters `'` (quote),
+ *      `\` (escape), `:` (option separator), `,` (filter separator), `;`
+ *      (filterchain separator) and `[`/`]` (link labels) are structural; each
+ *      occurrence is escaped with a backslash.
+ *   2. drawtext text expansion — a `%` starts a `%{...}` expansion, so a
+ *      literal percent must be doubled to `%%`.
+ *
+ * Newlines fold into spaces (card titles are single-line) and the text is
+ * truncated BEFORE escaping so an escape sequence can never be cut in half.
+ * Returns "" when nothing renderable remains — callers must then skip the
+ * drawtext filter entirely, because FFmpeg rejects an empty `text` value with
+ * "Either text, a valid file, a timecode or text source must be provided".
+ */
+export function escapeDrawText(raw: string | null | undefined, maxLength = 90): string {
+  if (typeof raw !== "string") return "";
+  const cleaned = raw
+    .replace(/\r?\n/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength)
+    .trim();
+  if (!cleaned) return "";
+  return cleaned
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\\'")
+    .replace(/:/g, "\\:")
+    .replace(/,/g, "\\,")
+    .replace(/;/g, "\\;")
+    .replace(/\[/g, "\\[")
+    .replace(/\]/g, "\\]")
+    .replace(/%/g, "%%");
+}
+
+/**
+ * Build one fully-escaped `drawtext=...` filter from its parts (no raw
+ * interpolation of user text). Returns null when the text is empty so the
+ * caller never emits an invalid `text=` option. `fontFile` is included only
+ * when a verified path is provided (see drawTextFontFile).
+ */
+export function buildDrawTextFilter(options: {
+  text: string | null | undefined;
+  color: string;
+  size: number;
+  x: string;
+  y: string;
+  fontFile?: string | null;
+  maxLength?: number;
+}): string | null {
+  const text = escapeDrawText(options.text, options.maxLength);
+  if (!text) return null;
+  const parts: string[] = [];
+  if (options.fontFile) parts.push(`fontfile=${quoteFilterPath(options.fontFile)}`);
+  parts.push(`fontcolor=${options.color}`);
+  parts.push(`fontsize=${Math.max(1, Math.round(options.size))}`);
+  parts.push(`x=${options.x}`);
+  parts.push(`y=${options.y}`);
+  parts.push(`text=${text}`);
+  return `drawtext=${parts.join(":")}`;
+}
+
+/**
+ * Build the full -vf chain for a documentary scene card: optional title,
+ * optional subtitle, the CLIPFORGE watermark, and the fade in/out. Text
+ * filters are skipped entirely when their text is empty; the gradient input
+ * and encoding parameters stay in generateSceneCard.
+ */
+export function buildSceneCardVf(options: {
+  title: string | null | undefined;
+  subtitle?: string | null;
+  fontFile?: string | null;
+  durationSec: number;
+}): string {
+  const duration = Math.max(2, options.durationSec);
+  const filters: string[] = [];
+  const title = buildDrawTextFilter({ text: options.title, color: "white", size: 96, x: "(w-text_w)/2", y: "h*0.30", fontFile: options.fontFile });
+  if (title) filters.push(title);
+  const subtitle = buildDrawTextFilter({ text: options.subtitle, color: "white@0.8", size: 48, x: "(w-text_w)/2", y: "h*0.30+170", fontFile: options.fontFile });
+  if (subtitle) filters.push(subtitle);
+  const watermark = buildDrawTextFilter({ text: "CLIPFORGE DOCUMENTARY", color: "white@0.45", size: 34, x: "w-360", y: "h-170", fontFile: options.fontFile });
+  if (watermark) filters.push(watermark);
+  const fadeOutStart = Math.max(0, duration - 1);
+  filters.push(`fade=t=in:st=0:d=1.1`);
+  filters.push(`fade=t=out:st=${fadeOutStart.toFixed(3)}:d=${Math.min(1, duration / 3).toFixed(3)}`);
+  return filters.join(",");
+}
+
+/** First existing regular file among the known font candidates, else null. */
+export function drawTextFontFile(): string | null {
+  const candidates = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+  ];
+  for (const candidate of candidates) {
+    try {
+      // Verify it is a real regular file before referencing it via fontfile —
+      // a stale or directory path makes drawtext fail at runtime.
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+    } catch {
+      /* keep looking */
+    }
+  }
+  return null;
+}
+
+/**
+ * Generate a documentary scene visual entirely with FFmpeg (no external image
+ * API): an animated gradient canvas plus title text, derived deterministically
+ * from the scene's visual prompt. This is the "procedural" asset generator —
+ * the scene's visualPrompt is persisted so a real image provider can replace
+ * it later without touching the pipeline.
+ */
+export async function generateSceneCard(options: {
+  output: string;
+  durationSec: number;
+  /** May be empty/undefined (e.g. corrupted checkpoint) — the title filter is
+   *  then skipped instead of emitting invalid FFmpeg. */
+  title?: string | null;
+  subtitle?: string | null;
+  width?: number;
+  height?: number;
+  fps?: number;
+  palette: [string, string];
+}): Promise<void> {
+  const width = options.width ?? 1080;
+  const height = options.height ?? 1920;
+  const fps = options.fps ?? 30;
+  const duration = Math.max(2, options.durationSec);
+  const [c0, c1] = options.palette;
+  // drawtext filters are built via buildSceneCardVf: user text is escaped,
+  // empty text is skipped entirely, and fontfile is only used when the font
+  // path was verified to exist.
+  const vf = buildSceneCardVf({
+    title: options.title,
+    subtitle: options.subtitle,
+    fontFile: drawTextFontFile(),
+    durationSec: duration,
+  });
+  await run(ffmpegBin(), [
+    "-hide_banner", "-loglevel", "error", "-y",
+    "-f", "lavfi",
+    "-i", `gradients=s=${width}x${height}:d=${duration.toFixed(3)}:c0=${c0}:c1=${c1}:x0=0:y0=0:x1=${width}:y1=${height}:nb_colors=2:type=linear:speed=0.04`,
+    "-vf", vf,
+    "-t", duration.toFixed(3),
+    "-r", String(fps),
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+    "-pix_fmt", "yuv420p", "-profile:v", "high",
+    "-movflags", "+faststart",
+    options.output,
+  ], { capture: true, timeoutSec: Math.max(240, Math.round(duration * 10)) });
+}
+
 /** Pull a still frame so the UI can show a poster for each clip. */
 export async function extractPoster(options: {
   input: string;

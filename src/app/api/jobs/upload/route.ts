@@ -32,6 +32,12 @@ export async function POST(request: Request) {
     const soundEffectAssetIds = url.searchParams.get("soundEffectAssetIds")?.split(",") ?? [];
     const music = validateMusicReference(url.searchParams.get("musicObjectKey"), url.searchParams.get("musicFileName"));
     pendingMusicKey = music.objectKey;
+    // Uploads support the original clips mode and movie explainer only.
+    const rawMode = url.searchParams.get("mode");
+    const mode = rawMode === "movie_explainer" ? "movie_explainer" as const : "clips" as const;
+    const rawTargetSecRaw = url.searchParams.get("targetSec");
+    const rawTargetSec = rawTargetSecRaw !== null && rawTargetSecRaw !== "" ? Number(rawTargetSecRaw) : NaN;
+    const targetSec = Number.isFinite(rawTargetSec) ? Math.max(30, Math.min(300, Math.round(rawTargetSec))) : null;
 
     const jobId = `job_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     uploadedKey = sourceObjectKey(jobId, fileName);
@@ -60,6 +66,8 @@ export async function POST(request: Request) {
       mediaMode: mediaMode ?? undefined,
       musicAssetIds,
       soundEffectAssetIds,
+      mode,
+      targetSec,
     });
     sourceAttachedToJob = true;
     pendingMusicKey = null;
