@@ -469,7 +469,10 @@ const SectionSchema = z.object({
   heading: z.enum(["hook", "setup", "what_happened", "why_it_matters", "payoff"]),
   title: z.string().trim().min(1).max(80),
   narration: z.string().trim().min(20).max(700),
-  targetSec: z.coerce.number().min(5).max(80).optional(),
+  // Nullable: the strict provider schema represents it as ["number","null"]
+  // (required, null when unknown) — a plain optional would reject model-
+  // emitted null via z.coerce.number(). null → estimated duration below.
+  targetSec: z.coerce.number().min(5).max(80).nullable().optional(),
   sceneStartSec: z.coerce.number().nonnegative().nullable().optional(),
   sceneEndSec: z.coerce.number().nonnegative().nullable().optional(),
   sceneTitle: z.string().trim().max(80).nullable().optional(),
@@ -480,6 +483,60 @@ const ScriptSchema = z.object({
   logline: z.string().trim().min(8).max(200),
   sections: z.array(SectionSchema).min(3).max(7),
 });
+
+/**
+ * Provider-facing structured schema for the explainer script. It mirrors the
+ * application ScriptSchema (which remains the final authority — this only
+ * constrains generation, it never weakens the Zod gate) and is declared
+ * EXPLICITLY strict for strict-mode providers: additionalProperties:false on
+ * the root and on sections items, every property listed in required, and the
+ * optional scene fields represented as nullable unions (strict mode has no
+ * "optional" — the model emits null when nothing fits).
+ */
+export const scriptOutputSchema: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    title: { type: "string", minLength: 3, maxLength: 90 },
+    logline: { type: "string", minLength: 8, maxLength: 200 },
+    sections: {
+      type: "array",
+      minItems: 3,
+      maxItems: 7,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          heading: { type: "string", enum: ["hook", "setup", "what_happened", "why_it_matters", "payoff"] },
+          title: { type: "string", minLength: 1, maxLength: 80 },
+          narration: { type: "string", minLength: 20, maxLength: 700 },
+          targetSec: { type: ["number", "null"] },
+          sceneStartSec: { type: ["number", "null"] },
+          sceneEndSec: { type: ["number", "null"] },
+          sceneTitle: { type: ["string", "null"] },
+        },
+        required: ["heading", "title", "narration", "targetSec", "sceneStartSec", "sceneEndSec", "sceneTitle"],
+      },
+    },
+  },
+  required: ["title", "logline", "sections"],
+};
+
+/**
+ * Final acceptance gate for explainer-script provider responses. It runs
+ * INSIDE the provider router (requestStructuredJson's validate step): a
+ * malformed/truncated JSON response or a schema-invalid object fails the
+ * attempt and the next configured provider is tried — HTTP 200 alone is
+ * never success. The Zod ScriptSchema is the final authority and is never
+ * relaxed here.
+ */
+export function validateScriptOutput(value: unknown): unknown {
+  // The router passes the already-extracted JSON; if raw content ever
+  // arrives as a string, extract here so malformed/truncated JSON is still
+  // rejected — never fabricated.
+  const json = typeof value === "string" ? extractJson(value) : value;
+  return ScriptSchema.parse(json);
+}
 
 export function explainerScriptPrompt(options: {
   durationSec: number;
@@ -513,9 +570,11 @@ export function explainerScriptPrompt(options: {
     "",
     "Rules:",
     "- narration must be original spoken commentary (2nd/3rd person), plain and direct, no quotes from the transcript, no stage directions.",
-    "- For each section set sceneStartSec/sceneEndSec to a source range (numeric seconds) that best illustrates it, taken from the event timestamps above; use null when nothing fits.",
+    "- narration must be concise: keep every section short enough that the complete JSON fits comfortably in the output budget. Never truncate the JSON — a cut-off object is unusable.",
+    "- For each section set sceneStartSec/sceneEndSec to a source range (plain numeric seconds, or null) that best illustrates it, taken from the event timestamps above; use null when nothing fits. Never strings, never ranges.",
     "- sceneTitle: a short label (max 60 chars) for the chosen footage, or null.",
-    "JSON only: {\"title\":\"…(max 80)\",\"logline\":\"…(max 160)\",\"sections\":[{\"heading\":\"hook\",\"title\":\"…\",\"narration\":\"…\",\"sceneStartSec\":null,\"sceneEndSec\":null,\"sceneTitle\":null}, …]}",
+    "Return EXACTLY ONE complete JSON object: no markdown, no code fences, no commentary before or after it, exactly 5 sections with headings exactly hook, setup, what_happened, why_it_matters, payoff — in that order.",
+    "JSON only: {\"title\":\"…(max 90)\",\"logline\":\"…(max 200)\",\"sections\":[{\"heading\":\"hook\",\"title\":\"…\",\"narration\":\"…\",\"sceneStartSec\":null,\"sceneEndSec\":null,\"sceneTitle\":null}, …]}",
   ].join("\n");
 }
 
@@ -529,6 +588,8 @@ export async function writeExplainerScript(options: {
   targetSec: number;
   sourceName: string;
   onCheckpoint?: (script: ExplainerScript) => void | Promise<void>;
+  /** Test hook: replaces the AI provider call (never set in production). */
+  callOverride?: CallProviderOverride;
 }): Promise<ExplainerScript> {
   const prompt = explainerScriptPrompt({
     durationSec: options.durationSec,
@@ -541,32 +602,20 @@ export async function writeExplainerScript(options: {
   const { value, provider, model } = await requestStructuredJsonWithRepair({
     system: SCRIPT_SYSTEM,
     user: prompt,
-    schema: {
-      type: "object",
-      properties: {
-        title: { type: "string" },
-        logline: { type: "string" },
-        sections: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              heading: { type: "string" },
-              title: { type: "string" },
-              narration: { type: "string" },
-              sceneStartSec: { type: "number" },
-              sceneEndSec: { type: "number" },
-              sceneTitle: { type: "string" },
-            },
-            required: ["heading", "title", "narration"],
-          },
-        },
-      },
-      required: ["title", "logline", "sections"],
-    },
-    outputTokenLimit: 1_800,
+    schema: scriptOutputSchema,
+    outputTokenLimit: config.analysisScriptOutputTokens,
     jobId: options.jobId,
     label: "explainer script",
+    // Script validation happens INSIDE the provider router: a provider is
+    // accepted only when its response extracts as JSON AND passes the Zod
+    // ScriptSchema. Malformed/truncated/schema-invalid HTTP-200 responses
+    // fail the attempt and fall through to the next configured provider.
+    validate: validateScriptOutput,
+    // Same strict-first behavior as the story stage: pass 1 sends the
+    // explicit strict schema via json_schema where the provider supports
+    // it (pass 2 repairs in json_object automatically).
+    strictFirstAttempt: true,
+    callOverride: options.callOverride,
   });
   const parsed = ScriptSchema.safeParse(value);
   if (!parsed.success) {

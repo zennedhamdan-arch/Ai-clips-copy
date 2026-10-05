@@ -134,6 +134,12 @@ export const config = {
    * both, or Groq fails with json_validate_failed and empty responses.
    */
   analysisStoryOutputTokens: num("ANALYSIS_STORY_OUTPUT_TOKENS", 2_048),
+  /**
+   * Output budget for the Movie Explainer script (five sections with
+   * narration). 1800 truncated real scripts in production; 3200 leaves
+   * headroom for reasoning models that share the budget with thinking.
+   */
+  analysisScriptOutputTokens: num("ANALYSIS_SCRIPT_OUTPUT_TOKENS", 3_200),
   /** Groq gpt-oss models: reasoning budget (minimal|low|medium|high). */
   groqReasoningEffort: str("GROQ_REASONING_EFFORT", "low"),
 
