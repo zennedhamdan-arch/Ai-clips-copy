@@ -59,6 +59,7 @@ process.env.NVIDIA_BASE_URL = `${base}/nvidia/v1`;
 process.env.ANALYSIS_PROVIDERS = "gemini,groq,openrouter,nvidia";
 
 const { requestStructuredJson } = await import("@/lib/analyze");
+const { analyzeStory } = await import("@/lib/movie-ai");
 
 const STORY_JSON = {
   characters: [{ name: "Maya", role: "protagonist", description: "Engineer chasing the leak." }],
@@ -198,6 +199,70 @@ test("NVIDIA 503 is TRANSIENT_PROVIDER_ERROR, distinct from its schema_validatio
   );
   assert.equal(requests.length, 8, "all four providers × two bounded passes");
   assert.equal(countByPath("/nvidia/"), 2, "one attempt per pass — the overload backoff gates, not removes, the provider");
+});
+
+test("END-TO-END: real analyzeStory → real storyAnalysisSchema → Groq strict payload → valid story accepted", async () => {
+  // Build a small 6-segment (60s) transcript. The story part is one chunk.
+  const segments = [];
+  for (let i = 0; i < 6; i += 1) {
+    segments.push({ start: i * 10, end: i * 10 + 9, text: `Segment ${i}: the crew argues about the failing reactor core.` });
+  }
+  const transcript = {
+    language: "en",
+    durationSec: 60,
+    text: segments.map((segment, i) => `[S${i}] ${segment.text}`).join("\n"),
+    segments,
+    words: [],
+    chunkCount: 1,
+    model: "whisper-test-model",
+  };
+
+  // gemini 503 (so groq must serve it); groq returns a schema-conformant story
+  // where the OPTIONAL fields are null (the point of the nullable fix — no
+  // invented values). The request MUST go through strict json_schema on the
+  // first pass with the normalized schema.
+  const storyWithNulls = {
+    characters: [{ name: "Maya", role: null, description: null }],
+    events: [
+      { startSegment: 0, endSegment: 2, summary: "Maya finds the overridden valve in the control room.", characters: ["Maya"], cause: null, effect: null, importance: null },
+    ],
+    arc: null,
+  };
+  responder = (req) => {
+    if (req.path.startsWith("/models/")) return gemini503();
+    if (req.path.startsWith("/groq/")) {
+      return { status: 200, json: { choices: [{ message: { content: JSON.stringify(storyWithNulls) } }] } };
+    }
+    return { status: 503, raw: "overloaded" };
+  };
+
+  const result = await analyzeStory({
+    jobId: "story-e2e",
+    transcript,
+    durationSec: 60,
+  });
+
+  assert.equal(result.provider, "groq", "Groq served the story after Gemini 503");
+  assert.equal(result.model, "openai/gpt-oss-120b");
+  assert.ok(result.events.length >= 1, "at least one event mapped");
+  // The real request captured on the wire: strict json_schema, normalized
+  // schema (additionalProperties:false on every object), and the gpt-oss
+  // reasoning budget so the constrained JSON fits.
+  const groq = requests.find((req) => req.path.startsWith("/groq/"));
+  assert.ok(groq, "groq was actually called over HTTP");
+  assert.equal(groq.body.response_format.type, "json_schema");
+  assert.equal(groq.body.response_format.json_schema.strict, true);
+  assert.equal(groq.body.reasoning_effort, "low");
+  const sentSchema: any = groq.body.response_format.json_schema.schema;
+  assert.equal(sentSchema.additionalProperties, false);
+  assert.equal(sentSchema.properties.characters.items.additionalProperties, false);
+  assert.deepEqual(sentSchema.properties.characters.items.properties.role.type, ["string", "null"]);
+  assert.deepEqual(sentSchema.properties.events.items.properties.cause.type, ["string", "null"]);
+
+  // null optionals mapped to sane downstream defaults (no invented data).
+  assert.equal(result.characters[0].name, "Maya");
+  assert.equal(result.characters[0].role, "unknown", "null role → 'unknown' default");
+  assert.equal(result.events[0].importance, 5, "null importance → 5 default");
 });
 
 test("all-persistent failures stop the chain after one pass (no endless provider cycling)", async () => {
