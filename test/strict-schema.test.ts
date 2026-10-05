@@ -5,20 +5,22 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AddressInfo } from "node:net";
 
 /**
- * Regression tests for the strict structured-JSON reliability fix.
+ * Regression tests for the structured-JSON reliability fix (round 2).
  *
- * Covers (Task 9): the SAME analysis_result shape as the story pipeline
- * (characters: array<object> + nested objects) sent to Groq — verifying the
- * request body has additionalProperties:false on EVERY object node — plus
- * malformed schema (fail BEFORE the request), empty provider response
- * (EMPTY_RESPONSE), HTTP 503 (transient → next provider), HTTP 400 schema
- * error (one retry, then fail fast), successful structured JSON, fallback
- * after a transient failure, and unsupported-format downgrade.
+ * The fixtures use the REAL story-analysis schema (storyAnalysisSchema from
+ * src/lib/movie-ai.ts) — not a toy replacement — run through:
+ *   normalizeStrictSchema() → validateFinalStrictSchema() →
+ *   Groq request payload construction (real HTTP request captured locally).
  *
- * The OpenAI-compatible providers are pointed at a LOCAL http server so the
- * exact request bodies are captured (no callOverride on the HTTP tests).
- * Every test file runs in its own process, so env is set before the app
- * module graph is imported (config is built at import time).
+ * Covers: recursive strict normalization, nullable optional fields, final
+ * schema validation, Groq valid structured response, Groq schema rejection
+ * (one bounded repair pass), Groq generation failure (json_validate_failed
+ * ≠ schema problem), OpenRouter empty response (reasoning-budget markers,
+ * no blind retry), and the normalizer's treatment of the actual story shape
+ * (characters[], characters[] nested objects, events[] nested objects).
+ *
+ * Every test file runs in its own process; env is set before the app module
+ * graph is imported (config is built at import time).
  */
 
 // ---------------------------------------------------------------------------
@@ -63,48 +65,13 @@ delete process.env.GEMINI_API_KEY;
 delete process.env.NVIDIA_API_KEY;
 
 const { requestStructuredJson } = await import("@/lib/analyze");
-const { auditStrictSchema, normalizeStrictSchema } = await import("@/lib/strict-schema");
+const { auditStrictSchema, normalizeStrictSchema, validateFinalStrictSchema } = await import("@/lib/strict-schema");
+const { storyAnalysisSchema } = await import("@/lib/movie-ai");
 const { AppError } = await import("@/lib/errors");
 
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
-
-/** The SAME analysis_result shape the story pipeline sends (nested objects). */
-const STORY_SHAPE_SCHEMA = {
-  type: "object",
-  properties: {
-    characters: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          name: { type: "string" },
-          role: { type: "string" },
-          description: { type: "string" },
-          firstSeenSec: { type: "number" },
-        },
-      },
-    },
-    events: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          startSegment: { type: "integer" },
-          endSegment: { type: "integer" },
-          summary: { type: "string" },
-          characters: { type: "array", items: { type: "string" } },
-          cause: { type: "string" },
-          effect: { type: "string" },
-          importance: { type: "integer" },
-        },
-      },
-    },
-    arc: { type: "string" },
-  },
-  required: ["events"],
-};
 
 const STORY_JSON = {
   title: "The Leak",
@@ -127,7 +94,7 @@ const validateStory = (value: unknown): unknown => {
   const v = value as Record<string, unknown> | null;
   if (!v || typeof v !== "object" || Array.isArray(v)) throw new Error("expected a story object");
   if (!Array.isArray(v.events) || v.events.length === 0) throw new Error("expected non-empty events");
-  if (!Array.isArray(v.characters)) throw new Error("expected characters array");
+  if (v.characters !== undefined && v.characters !== null && !Array.isArray(v.characters)) throw new Error("expected characters array or null");
   return value;
 };
 
@@ -136,48 +103,68 @@ const okJson = (payload: unknown): ResponderOut => ({
   json: { choices: [{ message: { content: typeof payload === "string" ? payload : JSON.stringify(payload) } }] },
 });
 
-const emptyJson = (): ResponderOut => ({ status: 200, json: { choices: [{ message: { content: "" } }] } });
+/** 200 with an EMPTY content field — the reasoning model spent its budget thinking. */
+const emptyJson = (): ResponderOut => ({
+  status: 200,
+  json: {
+    choices: [{ message: { content: "", reasoning: "thinking about the transcript…" }, finish_reason: "length" }],
+    usage: { completion_tokens: 2048, completion_tokens_details: { reasoning_tokens: 2037 } },
+  },
+});
 
-const GROQ_400_SCHEMA = { status: 400, raw: JSON.stringify({ error: { message: "Invalid JSON schema for response_format: 'analysis_result': /properties/characters/items: additionalProperties:false must be set on every object" } }) };
+const GROQ_400_SCHEMA = { status: 400, raw: JSON.stringify({ error: { message: "Invalid JSON schema for response_format: 'analysis_result': /properties/characters/items: additionalProperties:false must be set on every object", type: "invalid_request_error", code: "invalid_schema" } }) };
+const GROQ_400_GENERATION = { status: 400, raw: JSON.stringify({ error: { message: "Failed to validate JSON. Please adjust your prompt.", type: "invalid_request_error", code: "json_validate_failed", failed_generation: "" } }) };
 const GROQ_400_UNSUPPORTED = { status: 400, raw: JSON.stringify({ error: { message: "Unrecognized request argument supplied: response_format" } }) };
 
 function groqRequests(): RecordedRequest[] { return requests.filter((req) => req.path.startsWith("/groq/")); }
 function openRouterRequests(): RecordedRequest[] { return requests.filter((req) => req.path.startsWith("/openrouter/")); }
 
+function resetProviderState(): void {
+  (globalThis as Record<string, unknown>).__clipforgeProviderState = undefined;
+}
+
 afterEach(() => {
   requests.length = 0;
-  // Fresh provider runtime state (cooldowns/blocks/overload counters) per test.
-  (globalThis as Record<string, unknown>).__clipforgeProviderState = undefined;
+  responder = () => ({ status: 500, raw: "unexpected request" });
+  resetProviderState();
 });
 
-// Ensure the process can exit: close the local server and any keep-alive sockets.
 after(async () => {
   server.closeAllConnections?.();
   await new Promise<void>((resolve) => server.close(() => resolve()));
 });
 
+const USER = "Analyze the transcript part. Return {characters, events, arc} JSON.";
+
 // ---------------------------------------------------------------------------
-// Task 9: the schema actually SENT to Groq is strict on every object node
+// 1+2+4: the FINAL payload sent to Groq for the REAL story schema is strict
+// on every object node, uses nullable optionals, and budgets reasoning
 // ---------------------------------------------------------------------------
 
-test("strict schema sent to groq has additionalProperties:false on EVERY object node", async () => {
+test("final payload for the real story schema: strict on every object, nullable optionals, reasoning budget", async () => {
   responder = () => okJson(STORY_JSON);
   const result = await requestStructuredJson({
     system: "Return strict JSON only.",
-    user: "Analyze the transcript part. Return {characters, events, arc} JSON.",
-    schema: STORY_SHAPE_SCHEMA,
+    user: USER,
+    schema: storyAnalysisSchema,
     mode: "json_schema",
+    outputTokenLimit: 2_048,
     validate: validateStory,
   });
   assert.equal(result.provider, "groq");
   assert.equal(requests.length, 1);
 
-  const sent = groqRequests()[0].body.response_format;
-  assert.equal(sent.type, "json_schema", "structured output must stay json_schema (no silent format switch)");
-  assert.equal(sent.json_schema.name, "analysis_result");
-  assert.equal(sent.json_schema.strict, true);
-  const sentSchema = sent.json_schema.schema as Record<string, any>;
+  const sent = groqRequests()[0].body;
+  // Structured output stays strict json_schema (no silent format switch),
+  // and the gpt-oss reasoning model gets a capped reasoning effort so its
+  // hidden reasoning tokens do not eat the JSON budget.
+  assert.equal(sent.response_format.type, "json_schema");
+  assert.equal(sent.response_format.json_schema.name, "analysis_result");
+  assert.equal(sent.response_format.json_schema.strict, true);
+  assert.equal(sent.reasoning_effort, "low", "gpt-oss must get reasoning_effort=low");
+  assert.equal(sent.max_tokens, 2_048, "output budget must cover reasoning + JSON");
 
+  const sentSchema: Record<string, any> = sent.response_format.json_schema.schema;
   const objectPaths: string[] = [];
   const walk = (node: any, path: string): void => {
     if (Array.isArray(node)) {
@@ -201,18 +188,40 @@ test("strict schema sent to groq has additionalProperties:false on EVERY object 
   };
   walk(sentSchema, "$");
 
-  // Root AND the reported failure path /properties/characters/items, plus events items.
+  // Root AND /properties/characters/items AND /properties/events/items.
   assert.deepEqual(
     objectPaths.sort(),
     ["$", "$.properties.characters.items", "$.properties.events.items"],
   );
+
+  // Nullable optional fields (the reported /properties/characters/items path):
+  // semantically required stays plain, conceptually optional becomes ["t","null"].
+  const characterItem: any = sentSchema.properties.characters.items;
+  assert.equal(characterItem.additionalProperties, false, "/properties/characters/items sets additionalProperties:false");
+  assert.deepEqual(characterItem.properties.name.type, "string", "name is semantically required — stays non-nullable");
+  assert.deepEqual(characterItem.properties.role.type, ["string", "null"], "role is optional → nullable");
+  assert.deepEqual(characterItem.properties.description.type, ["string", "null"], "description is optional → nullable");
+
+  const eventItem: any = sentSchema.properties.events.items;
+  assert.equal(eventItem.additionalProperties, false);
+  assert.deepEqual(eventItem.properties.startSegment.type, "integer");
+  assert.deepEqual(eventItem.properties.endSegment.type, "integer");
+  assert.deepEqual(eventItem.properties.summary.type, "string");
+  assert.deepEqual(eventItem.properties.cause.type, ["string", "null"], "cause is optional → nullable");
+  assert.deepEqual(eventItem.properties.effect.type, ["string", "null"], "effect is optional → nullable");
+  assert.deepEqual(eventItem.properties.importance.type, ["integer", "null"], "importance is optional → nullable");
+  assert.deepEqual(eventItem.properties.characters.type, "array", "nested array optional stays non-nullable (no anyOf in strict)");
+  assert.deepEqual(eventItem.required.sort(), ["cause", "characters", "effect", "endSegment", "importance", "startSegment", "summary"]);
+
+  // Root: arc optional → nullable; no firstSeenSec anywhere (not consumed downstream).
+  assert.deepEqual(sentSchema.properties.arc.type, ["string", "null"]);
+  assert.equal(JSON.stringify(sentSchema).includes("firstSeenSec"), false, "unconsumed field was removed from the schema");
+  assert.deepEqual(sentSchema.required.sort(), ["arc", "characters", "events"]);
   assert.equal(sentSchema.additionalProperties, false);
-  assert.equal(sentSchema.properties.characters.items.additionalProperties, false, "/properties/characters/items must set additionalProperties:false");
-  assert.equal(sentSchema.properties.events.items.additionalProperties, false);
 });
 
 // ---------------------------------------------------------------------------
-// Task 2/5: malformed schema fails BEFORE any API request
+// 3: malformed schema fails BEFORE any request (local schema_validation_error)
 // ---------------------------------------------------------------------------
 
 test("malformed schema fails before any request (no provider burn-through)", async () => {
@@ -223,16 +232,10 @@ test("malformed schema fails before any request (no provider burn-through)", asy
     required: ["characters"],
   };
   await assert.rejects(
-    requestStructuredJson({
-      system: "Return strict JSON only.",
-      user: "Analyze the transcript part.",
-      schema: badSchema,
-      mode: "json_schema",
-      validate: validateStory,
-    }),
+    requestStructuredJson({ system: "Return strict JSON only.", user: USER, schema: badSchema, mode: "json_schema", validate: validateStory }),
     (error: unknown) => {
       assert.ok(error instanceof AppError, `expected AppError, got ${String(error)}`);
-      assert.equal(error.reason, "invalid_schema");
+      assert.match(String((error as Error & { detail?: string }).detail ?? ""), /schema_validation_error/);
       return true;
     },
   );
@@ -240,139 +243,158 @@ test("malformed schema fails before any request (no provider burn-through)", asy
 });
 
 // ---------------------------------------------------------------------------
-// Task 6: empty provider response → EMPTY_RESPONSE, no JSON.parse crash
+// 7: Groq generation failure (json_validate_failed) — distinct from schema rejection
 // ---------------------------------------------------------------------------
 
-test("empty provider response is marked EMPTY_RESPONSE with metadata and falls through", async () => {
-  responder = () => emptyJson();
-  const attempts: Array<{ provider: string; outcome: string; reason?: string }> = [];
+test("Groq json_validate_failed is a generation failure, not a schema problem (no blind same-request retry)", async () => {
+  responder = () => GROQ_400_GENERATION;
+  const attempts: Array<{ provider: string; category?: string; reason?: string; pass?: number }> = [];
   await assert.rejects(
     requestStructuredJson({
       system: "Return strict JSON only.",
-      user: "Analyze the transcript part.",
-      schema: STORY_SHAPE_SCHEMA,
+      user: USER,
+      schema: storyAnalysisSchema,
       mode: "json_schema",
+      outputTokenLimit: 2_048,
       validate: validateStory,
-      onAttempt: (info) => attempts.push({ provider: info.provider, outcome: info.outcome, reason: info.reason }),
+      onAttempt: (info) => attempts.push({ provider: info.provider, category: info.category, reason: info.reason, pass: info.pass }),
     }),
     (error: unknown) => {
       assert.ok(error instanceof AppError);
       assert.match(error.message, /All providers exhausted\./);
-      assert.match(error.message, /empty_response/);
-      assert.match(error.message, /provider=groq/);
-      assert.match(error.message, /provider=openrouter/);
+      assert.match(error.message, /STRUCTURED_GENERATION_FAILED/);
+      assert.match(error.message, /failed_generation_chars=0/);
+      assert.doesNotMatch(error.message, /SCHEMA_REQUEST_INVALID/);
       return true;
     },
   );
-  assert.equal(requests.length, 2, "each provider was tried once");
-  assert.deepEqual(
-    attempts.map((a) => [a.provider, a.outcome, a.reason]),
-    [["groq", "failed", "empty_response"], ["openrouter", "failed", "empty_response"]],
-  );
-});
-
-// ---------------------------------------------------------------------------
-// Task 7: 503 is transient overload → next provider (not a schema failure)
-// ---------------------------------------------------------------------------
-
-test("HTTP 503 from groq falls back to the next provider", async () => {
-  responder = (req) => (req.path.startsWith("/groq/") ? { status: 503, raw: "overloaded, try again later" } : okJson(STORY_JSON));
-  const attempts: Array<{ provider: string; outcome: string; reason?: string }> = [];
-  const result = await requestStructuredJson({
-    system: "Return strict JSON only.",
-    user: "Analyze the transcript part.",
-    schema: STORY_SHAPE_SCHEMA,
-    mode: "json_schema",
-    validate: validateStory,
-    onAttempt: (info) => attempts.push({ provider: info.provider, outcome: info.outcome, reason: info.reason }),
-  });
-  assert.equal(result.provider, "openrouter");
+  // Both providers failed with the generation error in pass 1 — all failures
+  // were persistent, so the chain STOPS (no pass 2, no endless cycling).
+  assert.equal(requests.length, 2);
   assert.equal(groqRequests().length, 1);
   assert.equal(openRouterRequests().length, 1);
-  assert.deepEqual(attempts, [
-    { provider: "groq", outcome: "failed", reason: "http_503" },
-    { provider: "openrouter", outcome: "passed", reason: undefined },
-  ]);
-});
-
-// ---------------------------------------------------------------------------
-// Task 5: HTTP 400 schema rejection → ONE retry, then fail fast
-// ---------------------------------------------------------------------------
-
-test("HTTP 400 schema rejection retries once then fails fast (no provider burn-through)", async () => {
-  let openrouterHits = 0;
-  responder = (req) => {
-    if (req.path.startsWith("/openrouter/")) {
-      openrouterHits += 1;
-      return okJson(STORY_JSON);
-    }
-    return GROQ_400_SCHEMA;
-  };
-  await assert.rejects(
-    requestStructuredJson({
-      system: "Return strict JSON only.",
-      user: "Analyze the transcript part.",
-      schema: STORY_SHAPE_SCHEMA,
-      mode: "json_schema",
-      validate: validateStory,
-    }),
-    (error: unknown) => {
-      assert.ok(error instanceof AppError, `expected AppError, got ${String(error)}`);
-      assert.equal(error.reason, "invalid_schema", "deterministic configuration error");
-      assert.match(error.message, /All providers exhausted\./);
-      assert.match(error.message, /groq/);
-      assert.doesNotMatch(error.message, /openrouter/);
-      return true;
-    },
+  assert.deepEqual(
+    attempts.map((a) => [a.provider, a.category, a.reason, a.pass]),
+    [
+      ["groq", "STRUCTURED_GENERATION_FAILED", "structured_generation_failed", 1],
+      ["openrouter", "STRUCTURED_GENERATION_FAILED", "structured_generation_failed", 1],
+    ],
   );
-  assert.equal(groqRequests().length, 2, "initial attempt + exactly ONE retry");
-  assert.equal(openrouterHits, 0, "remaining providers must not be burned with the same schema");
-  // Both groq requests used the strict envelope (retry is a normalized retry,
-  // not a silent downgrade).
-  for (const req of groqRequests()) {
-    assert.equal(req.body.response_format.type, "json_schema");
-    assert.equal(req.body.response_format.json_schema.schema.additionalProperties, false);
-  }
 });
 
 // ---------------------------------------------------------------------------
-// Task 3/5: unsupported structured-output mode → one downgrade, no repeat
+// 6: Groq schema rejection → ONE bounded repair pass (json_object), then done
 // ---------------------------------------------------------------------------
 
-test("unsupported strict format downgrades to json_object once on the same provider", async () => {
+test("Groq schema rejection runs one bounded repair pass in json_object, not repeated strict retries", async () => {
   let groqCalls = 0;
   responder = (req) => {
-    if (req.path.startsWith("/groq/")) {
-      groqCalls += 1;
-      return groqCalls === 1 ? GROQ_400_UNSUPPORTED : okJson(STORY_JSON);
-    }
+    if (req.path.startsWith("/openrouter/")) return GROQ_400_SCHEMA;
+    groqCalls += 1;
+    // Pass 1 strict request → 400 schema rejection. Pass 2 json_object → success.
+    if (req.body.response_format?.type === "json_schema") return GROQ_400_SCHEMA;
     return okJson(STORY_JSON);
   };
   const result = await requestStructuredJson({
     system: "Return strict JSON only.",
-    user: "Analyze the transcript part.",
-    schema: STORY_SHAPE_SCHEMA,
+    user: USER,
+    schema: storyAnalysisSchema,
     mode: "json_schema",
+    outputTokenLimit: 2_048,
     validate: validateStory,
   });
   assert.equal(result.provider, "groq");
-  assert.equal(groqRequests().length, 2, "no repeated retries of the same strict request");
+  // groq: pass 1 strict (400) + pass 2 json_object (200) = exactly 2 calls.
+  assert.equal(groqCalls, 2);
   assert.equal(groqRequests()[0].body.response_format.type, "json_schema");
   assert.deepEqual(groqRequests()[1].body.response_format, { type: "json_object" });
-  assert.equal(openRouterRequests().length, 0);
+  // openrouter was tried once in pass 1 and not re-cycled in pass 2 (groq won).
+  assert.equal(openRouterRequests().length, 1);
 });
 
 // ---------------------------------------------------------------------------
-// Successful structured JSON
+// 8: unsupported structured-output mode → UNSUPPORTED_STRUCTURED_OUTPUT, one looser retry
+// ---------------------------------------------------------------------------
+
+test("unsupported strict format is classified and retried once in json_object", async () => {
+  let groqCalls = 0;
+  responder = (req) => {
+    if (req.path.startsWith("/openrouter/")) return { status: 503, raw: "overloaded" };
+    groqCalls += 1;
+    return groqCalls === 1 ? GROQ_400_UNSUPPORTED : okJson(STORY_JSON);
+  };
+  const attempts: Array<{ provider: string; category?: string }> = [];
+  const result = await requestStructuredJson({
+    system: "Return strict JSON only.",
+    user: USER,
+    schema: storyAnalysisSchema,
+    mode: "json_schema",
+    outputTokenLimit: 2_048,
+    validate: validateStory,
+    onAttempt: (info) => attempts.push({ provider: info.provider, category: info.category }),
+  });
+  assert.equal(result.provider, "groq");
+  assert.equal(groqCalls, 2, "no repeated retries of the same strict request");
+  assert.equal(groqRequests()[0].body.response_format.type, "json_schema");
+  assert.deepEqual(groqRequests()[1].body.response_format, { type: "json_object" });
+  assert.equal(openRouterRequests().length, 1, "the 503'd provider is not re-tried within the same pass");
+  assert.deepEqual(
+    attempts.filter((a) => a.provider === "groq").map((a) => a.category),
+    ["UNSUPPORTED_STRUCTURED_OUTPUT", undefined],
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 5: OpenRouter-style EMPTY_RESPONSE with reasoning-budget markers, no blind retry
+// ---------------------------------------------------------------------------
+
+test("empty response is marked EMPTY_RESPONSE with finish_reason/reasoning markers and NOT blindly retried", async () => {
+  responder = () => emptyJson();
+  const attempts: Array<{ provider: string; category?: string; reason?: string }> = [];
+  await assert.rejects(
+    requestStructuredJson({
+      system: "Return strict JSON only.",
+      user: USER,
+      schema: storyAnalysisSchema,
+      mode: "json_schema",
+      outputTokenLimit: 2_048,
+      validate: validateStory,
+      onAttempt: (info) => attempts.push({ provider: info.provider, category: info.category, reason: info.reason }),
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof AppError);
+      assert.match(error.message, /All providers exhausted\./);
+      assert.match(error.message, /EMPTY_RESPONSE/);
+      assert.match(error.message, /finish_reason=length/);
+      assert.match(error.message, /reasoning_tokens=2037/);
+      assert.match(error.message, /provider=openrouter/);
+      return true;
+    },
+  );
+  // One attempt per provider, and both were EMPTY_RESPONSE (persistent) →
+  // the chain stops: the exact same request is never retried blindly.
+  assert.equal(requests.length, 2);
+  assert.deepEqual(
+    attempts.map((a) => [a.provider, a.category, a.reason]),
+    [
+      ["groq", "EMPTY_RESPONSE", "empty_response"],
+      ["openrouter", "EMPTY_RESPONSE", "empty_response"],
+    ],
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 9: successful structured JSON
 // ---------------------------------------------------------------------------
 
 test("valid structured JSON succeeds on the first provider", async () => {
   responder = () => okJson(STORY_JSON);
   const result = await requestStructuredJson({
     system: "Return strict JSON only.",
-    user: "Analyze the transcript part.",
-    schema: STORY_SHAPE_SCHEMA,
+    user: USER,
+    schema: storyAnalysisSchema,
     mode: "json_schema",
+    outputTokenLimit: 2_048,
     validate: validateStory,
   });
   assert.equal(result.provider, "groq");
@@ -383,30 +405,40 @@ test("valid structured JSON succeeds on the first provider", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Task 2: shared normalizer unit behavior
+// Normalizer + final-validator unit behavior on the REAL story schema
 // ---------------------------------------------------------------------------
 
-test("normalizer: story shape → additionalProperties:false on every object, full required lists", () => {
-  const audit = auditStrictSchema(STORY_SHAPE_SCHEMA);
+test("normalizer: real story schema → strict objects, nullable optionals, no mutation, cached", () => {
+  const audit = auditStrictSchema(storyAnalysisSchema);
   assert.ok(audit.ok, `expected fixable schema, got hard issues: ${JSON.stringify(audit.hardIssues)}`);
-  assert.ok(audit.fixes.length >= 3, "root + characters.items + events.items need fixes");
+  assert.ok(audit.fixes.length >= 6, "root + character fields + event fields + arc need fixes");
 
-  const { ok, schema, fixes } = normalizeStrictSchema(STORY_SHAPE_SCHEMA);
+  const { ok, schema, fixes } = normalizeStrictSchema(storyAnalysisSchema);
   assert.ok(ok);
   assert.ok(schema);
-  assert.ok(fixes.length >= 3);
-  assert.equal(schema.additionalProperties, false);
-  assert.equal(schema.properties.characters.items.additionalProperties, false, "the reported /properties/characters/items path is fixed");
-  assert.equal(schema.properties.events.items.additionalProperties, false);
-  assert.deepEqual(
-    (schema.properties.characters.items.required as string[]).sort(),
-    ["description", "firstSeenSec", "name", "role"],
-  );
-  assert.deepEqual(
-    (schema.properties.events.items.required as string[]).sort(),
-    ["cause", "characters", "effect", "endSegment", "importance", "startSegment", "summary"],
-  );
-  assert.deepEqual((schema.required as string[]).sort(), ["arc", "characters", "events"]);
+  assert.ok(fixes.length >= 6);
+  const final = schema as any;
+
+  assert.equal(final.additionalProperties, false);
+  assert.deepEqual(final.properties.characters.items.additionalProperties, false, "the reported /properties/characters/items path is fixed");
+  assert.deepEqual(final.properties.events.items.additionalProperties, false);
+  assert.deepEqual(final.properties.characters.items.required, ["name", "role", "description"]);
+  assert.deepEqual(final.properties.events.items.required, ["startSegment", "endSegment", "summary", "characters", "cause", "effect", "importance"]);
+  assert.deepEqual(final.required, ["events", "characters", "arc"]);
+  assert.deepEqual(final.properties.characters.items.properties.role.type, ["string", "null"]);
+  assert.deepEqual(final.properties.events.items.properties.importance.type, ["integer", "null"]);
+  assert.equal(final.properties.characters.items.properties.name.type, "string");
+
+  // The FINAL schema must pass the local validator before any request.
+  const check = validateFinalStrictSchema(schema);
+  assert.deepEqual(check, { ok: true, issues: [] });
+
+  // Never mutates the caller's schema; result is cached per reference.
+  assert.equal((storyAnalysisSchema.required as string[]).length, 1, "original required list untouched");
+  assert.ok(!("additionalProperties" in storyAnalysisSchema), "original root untouched");
+  const first = normalizeStrictSchema(storyAnalysisSchema);
+  const second = normalizeStrictSchema(storyAnalysisSchema);
+  assert.equal(second, first, "cached result for the same schema reference");
 });
 
 test("normalizer: malformed schemas are rejected with hard issues and a null schema", () => {
@@ -416,38 +448,41 @@ test("normalizer: malformed schemas are rejected with hard issues and a null sch
     { type: "object", properties: { a: { type: "string", enum: [] } } },
     { type: "object", properties: { a: { type: "array" } } },
     { type: "object", properties: { a: { type: "string" } }, required: ["missing"] },
+    { type: "object", properties: { a: { type: ["string", "boolean"] } } },
+    { type: "object", properties: { a: { type: "string", minLength: 10, maxLength: 5 } } },
   ];
-  for (const schema of cases) {
-    const result = normalizeStrictSchema(schema);
-    assert.equal(result.ok, false, `expected hard issues for ${JSON.stringify(schema)}`);
+  for (const bad of cases) {
+    const result = normalizeStrictSchema(bad);
+    assert.equal(result.ok, false, `expected hard issues for ${JSON.stringify(bad)}`);
     assert.equal(result.schema, null);
     assert.ok(result.hardIssues.length > 0);
   }
 });
 
-test("normalizer: already-strict schema needs no fixes and is not mutated; cache is stable", () => {
-  const strict = {
+test("final validator: catches every invariant a normalized schema must satisfy", () => {
+  // A fully valid strict schema passes.
+  const valid = {
     type: "object",
     additionalProperties: false,
-    required: ["clips"],
-    properties: {
-      clips: {
-        type: "array",
-        items: { type: "object", additionalProperties: false, required: ["title"], properties: { title: { type: "string" } } },
-      },
-    },
+    required: ["a"],
+    properties: { a: { type: ["string", "null"] } },
   };
-  const first = normalizeStrictSchema(strict);
-  assert.equal(first.ok, true);
-  assert.equal(first.fixes.length, 0);
-  assert.notEqual(first.schema, strict, "always returns a defensive copy");
-  assert.deepEqual(first.schema, strict);
-  const second = normalizeStrictSchema(strict);
-  assert.equal(second, first, "cached result for the same schema reference");
+  assert.deepEqual(validateFinalStrictSchema(valid), { ok: true, issues: [] });
 
-  const mutated = normalizeStrictSchema(STORY_SHAPE_SCHEMA);
-  assert.ok(mutated.schema);
-  assert.notEqual(mutated.schema, STORY_SHAPE_SCHEMA, "must not mutate the caller's schema");
-  assert.equal((STORY_SHAPE_SCHEMA.required as string[]).length, 1, "original required list untouched");
-  assert.ok(!("additionalProperties" in STORY_SHAPE_SCHEMA), "original root untouched");
+  const broken: Array<[string, Record<string, unknown>]> = [
+    ["missing additionalProperties", { type: "object", required: ["a"], properties: { a: { type: "string" } } }],
+    ["property missing from required", { type: "object", additionalProperties: false, required: [], properties: { a: { type: "string" } } }],
+    ["required not in properties", { type: "object", additionalProperties: false, required: ["zz"], properties: {} }],
+    ["bad type union", { type: "object", additionalProperties: false, required: ["a"], properties: { a: { type: ["string", "boolean"] } } }],
+    ["non-scalar type union", { type: "object", additionalProperties: false, required: ["a"], properties: { a: { type: ["object", "null"] } } }],
+    ["minItems > maxItems", { type: "object", additionalProperties: false, required: ["a"], properties: { a: { type: "array", minItems: 5, maxItems: 2, items: { type: "string" } } } }],
+    ["array without items", { type: "object", additionalProperties: false, required: ["a"], properties: { a: { type: "array" } } }],
+    ["root not an object", { type: "string" }],
+    ["unsupported key", { type: "object", additionalProperties: false, required: ["a"], properties: { a: { type: "string" } }, $defs: {} }],
+  ];
+  for (const [label, bad] of broken) {
+    const check = validateFinalStrictSchema(bad);
+    assert.equal(check.ok, false, `${label} must be rejected`);
+    assert.ok(check.issues.length > 0, `${label} must report issues`);
+  }
 });

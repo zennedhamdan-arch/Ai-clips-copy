@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
+import { config } from "./config";
 import { AppError } from "./errors";
 import { extractJson, requestStructuredJson, splitTranscriptForAnalysis, type CallProviderOverride, type StructuredJsonAttemptInfo } from "./analyze";
 import { estimateNarrationDurationSec } from "./audio/router";
@@ -25,10 +26,13 @@ import type {
 
 const STORY_SYSTEM = "You are a meticulous film analyst. You understand characters, events, relationships, cause and effect, and plot progression. Return strict JSON only — no markdown, no commentary outside JSON.";
 
+// Optional fields are nullable: the provider schema represents them as
+// ["<t>", "null"] (strict mode has no "optional"), so the model answers null
+// when a field does not apply instead of inventing a value.
 const StoryCharacterSchema = z.object({
   name: z.string().trim().min(1).max(60),
-  role: z.string().trim().max(40).optional(),
-  description: z.string().trim().max(240).optional(),
+  role: z.string().trim().max(40).nullable().optional(),
+  description: z.string().trim().max(240).nullable().optional(),
   firstSeenSec: z.coerce.number().nonnegative().nullable().optional(),
 });
 
@@ -36,21 +40,75 @@ const StoryEventSchema = z.object({
   startSegment: z.coerce.number().int().nonnegative(),
   endSegment: z.coerce.number().int().nonnegative(),
   summary: z.string().trim().min(4).max(300),
-  characters: z.array(z.string().trim().min(1).max(60)).max(12).optional(),
+  characters: z.array(z.string().trim().min(1).max(60)).max(12).nullable().optional(),
   cause: z.string().trim().max(200).nullable().optional(),
   effect: z.string().trim().max(200).nullable().optional(),
-  importance: z.coerce.number().min(1).max(10).optional(),
+  importance: z.coerce.number().min(1).max(10).nullable().optional(),
 });
 
 function storyChunkSchema() {
   return z.object({
-    characters: z.array(StoryCharacterSchema).max(20).optional(),
+    characters: z.array(StoryCharacterSchema).max(20).nullable().optional(),
     events: z.array(StoryEventSchema).min(1).max(12).optional(),
-    arc: z.string().trim().max(400).optional(),
+    arc: z.string().trim().max(400).nullable().optional(),
   });
 }
 
 type StoryChunkParsed = z.infer<ReturnType<typeof storyChunkSchema>>;
+
+/**
+ * The EXACT structured schema ("analysis_result") sent to providers for
+ * story-part analysis.
+ *
+ * Field policy (kept deliberately small — every field is consumed
+ * downstream by the script prompt or scene selection):
+ *  - `required` below = semantically essential: the pipeline cannot map the
+ *    part without events + segment boundaries + summary, or a character name.
+ *  - Everything else declared in `properties` is conceptually optional. The
+ *    shared strict-schema normalizer (src/lib/strict-schema.ts) promotes
+ *    those to NULLABLE required fields (type ["<t>","null"]) so the model
+ *    emits null instead of inventing values — never blindly required.
+ *  - Fields that are not consumed anywhere are NOT requested (firstSeenSec
+ *    was dropped: it was stored but never used).
+ */
+export const storyAnalysisSchema: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    characters: {
+      type: "array",
+      maxItems: 20,
+      items: {
+        type: "object",
+        properties: {
+          name: { type: "string", minLength: 1, maxLength: 60 },
+          role: { type: "string", maxLength: 40 },
+          description: { type: "string", maxLength: 240 },
+        },
+        required: ["name"],
+      },
+    },
+    events: {
+      type: "array",
+      minItems: 1,
+      maxItems: 12,
+      items: {
+        type: "object",
+        properties: {
+          startSegment: { type: "integer", minimum: 0 },
+          endSegment: { type: "integer", minimum: 0 },
+          summary: { type: "string", minLength: 1, maxLength: 240 },
+          characters: { type: "array", maxItems: 12, items: { type: "string", maxLength: 60 } },
+          cause: { type: "string", maxLength: 200 },
+          effect: { type: "string", maxLength: 200 },
+          importance: { type: "integer", minimum: 1, maximum: 10 },
+        },
+        required: ["startSegment", "endSegment", "summary"],
+      },
+    },
+    arc: { type: "string", maxLength: 400 },
+  },
+  required: ["events"],
+};
 
 function storySignature(transcript: Transcript): string {
   return [
@@ -78,9 +136,10 @@ function storyChunkPrompt(chunk: { index: number; block: string; startSec: numbe
     `This is transcript part ${chunk.index + 1} of ${totalChunks} (roughly ${chunk.startSec.toFixed(0)}s-${chunk.endSec.toFixed(0)}s) of one continuous movie/video.`,
     "Extract the story understanding for THIS part only, using the [S####] segment indexes shown.",
     "Rules:",
-    "- characters: who appears or is discussed (name, role: protagonist/antagonist/supporting/narrator, one short description, firstSeenSec in seconds if known).",
+    "- characters: who appears or is discussed (name, role: protagonist/antagonist/supporting/narrator, one short description).",
     "- events: 1-8 distinct things that HAPPEN (startSegment/endSegment = inclusive S indexes from this part, summary max 240 chars, characters involved, cause and effect when present, importance 1-10 for the whole story).",
     "- arc: one or two sentences describing how this part moves the story forward.",
+    "- Use null for optional fields that do not apply (role, description, cause, effect, importance, characters, arc). Every listed field must be present in the JSON.",
     "Describe only what is actually spoken or implied — never invent plot. JSON only: {\"characters\":[...],\"events\":[...],\"arc\":\"...\"}",
     "TRANSCRIPT",
     chunk.block,
@@ -189,15 +248,7 @@ export async function analyzeStory(options: {
     }
     await options.onProgress?.(chunk.index, chunks.length, `Understanding the story — part ${chunk.index + 1} of ${chunks.length}…`);
     const prompt = storyChunkPrompt(chunk, chunks.length);
-    const schema = {
-      type: "object",
-      properties: {
-        characters: { type: "array", items: { type: "object", properties: { name: { type: "string" }, role: { type: "string" }, description: { type: "string" }, firstSeenSec: { type: "number" } } } },
-        events: { type: "array", items: { type: "object", properties: { startSegment: { type: "integer" }, endSegment: { type: "integer" }, summary: { type: "string" }, characters: { type: "array", items: { type: "string" } }, cause: { type: "string" }, effect: { type: "string" }, importance: { type: "integer" } } } },
-        arc: { type: "string" },
-      },
-      required: ["events"],
-    };
+    const schema = storyAnalysisSchema;
     const suppliedIndexes = [...prompt.matchAll(/\[S(\d+)/g)].map((match) => Number(match[1]));
     const suppliedStart = suppliedIndexes.length ? Math.min(...suppliedIndexes) : chunk.startSegment;
     const suppliedEnd = suppliedIndexes.length ? Math.max(...suppliedIndexes) : chunk.endSegment;
@@ -261,14 +312,19 @@ export async function analyzeStory(options: {
     let partCharacters: StoryCharacter[] = [];
     let partArc = "";
     try {
-      // Provider fallback on FINAL schema validation (strict json_schema on
-      // the first pass where supported), plus one bounded repair round for
-      // malformed JSON. Providers are tried sequentially.
+      // Bounded provider-chain on FINAL schema validation: pass 1 walks every
+      // configured provider once (strict json_schema where supported), and
+      // ONE additional repair/retry pass runs only for deterministic schema
+      // or transient failures. Providers are tried sequentially, never
+      // re-cycled endlessly.
       const { value: parsedValue, provider, model } = await requestStructuredJsonWithRepair({
         system: STORY_SYSTEM,
         user: prompt,
         schema,
-        outputTokenLimit: 1_400,
+        // Reasoning models (gpt-oss, gemini-2.5-flash) draw hidden reasoning
+        // tokens from this budget too — 2048 leaves headroom for the JSON
+        // itself (see GROQ json_validate_failed with empty failed_generation).
+        outputTokenLimit: config.analysisStoryOutputTokens,
         jobId: options.jobId,
         label: `story part ${chunk.index + 1}`,
         validate: validateStoryPart,
@@ -362,6 +418,15 @@ export type StructuredJsonRepairResult = {
  * providers sequentially; pass 1 uses strict json_schema where the provider
  * supports it (when `strictFirstAttempt`), the repair pass uses json_object.
  */
+/**
+ * requestStructuredJson with a final validation gate. The bounded
+ * provider-chain retry policy (pass 1 = every provider once; one bounded
+ * repair/retry pass only for deterministic schema or transient failures)
+ * lives INSIDE requestStructuredJson, so this wrapper does NOT add a second
+ * full provider walk on top of it — doing so was what produced the
+ * unbounded "attempts 5,6,7,8" loop. `strictFirstAttempt` selects strict
+ * json_schema for pass 1 (pass 2 uses json_object automatically).
+ */
 export async function requestStructuredJsonWithRepair(options: {
   system: string;
   user: string;
@@ -379,25 +444,17 @@ export async function requestStructuredJsonWithRepair(options: {
   /** Test hook: replaces the real provider call (never set in production). */
   callOverride?: CallProviderOverride;
 }): Promise<StructuredJsonRepairResult> {
-  const run = async (user: string, pass: number): Promise<StructuredJsonRepairResult> => {
-    const result = await requestStructuredJson({
-      system: options.system,
-      user,
-      schema: options.schema,
-      outputTokenLimit: options.outputTokenLimit,
-      mode: options.strictFirstAttempt && pass === 1 ? "json_schema" : "json_object",
-      validate: options.validate,
-      onAttempt: options.onAttempt,
-      callOverride: options.callOverride,
-    });
-    return { value: extractJson(result.content), provider: result.provider, model: result.model };
-  };
-  try {
-    return await run(options.user, 1);
-  } catch (firstError) {
-    console.warn(`[ai-json] job=${options.jobId ?? "unknown"} ${options.label ?? "request"} first attempt failed: ${(firstError as Error).message.slice(0, 200)}; retrying with repair instruction`);
-    return run(`${options.user}\n\nCORRECTION: Your previous response was not usable. Return ONLY one complete valid JSON object that exactly matches the requested shape — no markdown, no trailing commas, no text outside the JSON.`, 2);
-  }
+  const result = await requestStructuredJson({
+    system: options.system,
+    user: options.user,
+    schema: options.schema,
+    outputTokenLimit: options.outputTokenLimit,
+    mode: options.strictFirstAttempt ? "json_schema" : "json_object",
+    validate: options.validate,
+    onAttempt: options.onAttempt,
+    callOverride: options.callOverride,
+  });
+  return { value: extractJson(result.content), provider: result.provider, model: result.model };
 }
 
 /* ------------------------------------------------------------------ */

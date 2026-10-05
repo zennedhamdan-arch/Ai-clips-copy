@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { config, providersConfigured, type AnalysisProvider } from "./config";
 import { AppError, describeHttpStatus } from "./errors";
-import { normalizeStrictSchema } from "./strict-schema";
+import { normalizeStrictSchema, validateFinalStrictSchema } from "./strict-schema";
 import type { AnalysisCheckpoint, AnalysisCheckpointAttempt, ClipCandidate, Transcript } from "./types";
 import { preferredClipMin } from "./clip-duration";
 import { validateClips } from "./validate";
@@ -283,6 +283,10 @@ export type StructuredJsonAttemptInfo = {
   outcome: "passed" | "failed";
   /** "http_503" | "http_429" | "invalid_json" | "schema_validation" | "invalid_segment" | "timeout" | … */
   reason?: string;
+  /** Provider-chain pass number (1 = first walk, 2 = bounded retry/repair pass). */
+  pass?: number;
+  /** Failure category for attribution: SCHEMA_REQUEST_INVALID | STRUCTURED_GENERATION_FAILED | EMPTY_RESPONSE | TRANSIENT_PROVIDER_ERROR | UNSUPPORTED_STRUCTURED_OUTPUT | PROVIDER_UNAVAILABLE. */
+  category?: string;
 };
 
 function providerModel(provider: AnalysisProvider): string {
@@ -425,14 +429,24 @@ async function callOpenAiCompatible(options: {
   let strictSchema: Record<string, unknown> | null = null;
   if (effectiveMode === "json_schema") {
     // Shared strict-schema layer: audit + normalize the schema recursively
-    // (additionalProperties:false on every object, full required lists) and
-    // fail BEFORE the API request when it cannot be expressed in strict mode.
+    // (additionalProperties:false on every object, full required lists,
+    // optional fields promoted to nullable), then validate the FINAL
+    // provider schema. Both steps run LOCALLY and fail BEFORE the API
+    // request — an invalid schema is never sent to Groq.
     const normalized = normalizeStrictSchema(options.schema);
     if (!normalized.schema) {
       throw new AppError("bad_request", `${providerLabel(options.provider)} request not sent: strict JSON schema is invalid.`, {
-        detail: normalized.hardIssues.slice(0, 5).map((issue) => `${issue.path}: ${issue.message}`).join("; "),
+        detail: `schema_validation_error (local pre-flight): ${normalized.hardIssues.slice(0, 5).map((issue) => `${issue.path}: ${issue.message}`).join("; ")}`,
         status: 500,
-        reason: "invalid_schema",
+        reason: "schema_request_invalid",
+      });
+    }
+    const finalCheck = validateFinalStrictSchema(normalized.schema);
+    if (!finalCheck.ok) {
+      throw new AppError("bad_request", `${providerLabel(options.provider)} request not sent: final strict JSON schema failed local validation.`, {
+        detail: `schema_validation_error (final schema): ${finalCheck.issues.slice(0, 5).map((issue) => `${issue.path}: ${issue.message}`).join("; ")}`,
+        status: 500,
+        reason: "schema_request_invalid",
       });
     }
     strictSchema = normalized.schema;
@@ -440,8 +454,9 @@ async function callOpenAiCompatible(options: {
       console.info(`[analysis] provider=${options.provider} strict_schema_fixes=${normalized.fixes.length} first=${normalized.fixes[0]}`);
     }
   }
-  const body = {
-    model: providerModel(options.provider),
+  const model = providerModel(options.provider);
+  const body: Record<string, unknown> = {
+    model,
     temperature: 0.2,
     max_tokens: options.outputTokenLimit,
     messages: [{ role: "system", content: options.system }, { role: "user", content: options.user }],
@@ -449,6 +464,13 @@ async function callOpenAiCompatible(options: {
       ? { type: "json_schema", json_schema: { name: "analysis_result", strict: true, schema: strictSchema } }
       : { type: "json_object" },
   };
+  // gpt-oss is a reasoning model: its hidden reasoning tokens are drawn from
+  // the same max_tokens budget as the answer. Capping the reasoning effort
+  // leaves budget for the (schema-constrained) JSON and is the documented
+  // fix for 400 json_validate_failed with an empty failed_generation.
+  if (isGroq && /gpt-oss/i.test(model)) {
+    body.reasoning_effort = config.groqReasoningEffort || "low";
+  }
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers: {
@@ -464,22 +486,36 @@ async function callOpenAiCompatible(options: {
   });
   if (!response.ok) {
     const text = await response.text().catch(() => "");
-    if (response.status === 400 && effectiveMode === "json_schema") {
-      const strictFailure = classifyStrictMode400(text);
-      if (strictFailure === "schema_rejected") {
+    if (response.status === 400) {
+      const classification = classifyProvider400(text, effectiveMode);
+      if (classification.kind === "generation_failed") {
+        // The schema was ACCEPTED and the request reached generation — the
+        // MODEL could not produce a schema-valid completion (for reasoning
+        // models this is usually the hidden reasoning tokens consuming the
+        // max_tokens budget). This is a generation failure, NOT a schema
+        // request problem: retrying the same strict request is pointless,
+        // but a looser mode / another provider may still succeed.
+        throw new AppError("invalid_ai_output", `${providerLabel(options.provider)} structured generation failed (HTTP 400).`, {
+          detail: `code=${classification.code || "n/a"} failed_generation_chars=${classification.failedGenerationChars ?? 0} ${classification.message.slice(0, 200)}`,
+          status: 502,
+          providerStatus: 400,
+          reason: "structured_generation_failed",
+        });
+      }
+      if (classification.kind === "schema_rejected") {
         throw new AppError("bad_request", `${providerLabel(options.provider)} rejected the JSON schema (HTTP 400).`, {
           detail: text.slice(0, 400),
           status: 502,
           providerStatus: 400,
-          reason: "schema_rejected",
+          reason: "schema_request_invalid",
         });
       }
-      if (strictFailure === "unsupported_format") {
-        throw new AppError("bad_request", `${providerLabel(options.provider)} does not support strict structured output (HTTP 400).`, {
+      if (classification.kind === "unsupported_format") {
+        throw new AppError("bad_request", `${providerLabel(options.provider)} does not support the requested structured output mode (HTTP 400).`, {
           detail: text.slice(0, 400),
           status: 502,
           providerStatus: 400,
-          reason: "unsupported_format",
+          reason: "unsupported_structured_output",
         });
       }
     }
@@ -490,13 +526,34 @@ async function callOpenAiCompatible(options: {
       retryAfterMilliseconds(response),
     );
   }
-  const parsed = await response.json() as { choices?: Array<{ message?: { content?: string | null } }> };
-  const content = parsed.choices?.[0]?.message?.content;
+  const parsed = await response.json() as {
+    choices?: Array<{
+      finish_reason?: string | null;
+      message?: { content?: string | null; reasoning?: string };
+    }>;
+    usage?: { completion_tokens?: number; completion_tokens_details?: { reasoning_tokens?: number } };
+  };
+  const choice = parsed.choices?.[0];
+  const content = choice?.message?.content;
+  // Diagnostics (safe metadata only — never the transcript or reasoning
+  // text itself): reasoning models can consume the whole max_tokens budget
+  // thinking, leaving no content, or be truncated at the token limit.
+  const finishReason = choice?.finish_reason ?? null;
+  const reasoningChars = typeof choice?.message?.reasoning === "string" ? choice.message.reasoning.length : 0;
+  const reasoningTokens = parsed.usage?.completion_tokens_details?.reasoning_tokens ?? null;
+  const completionTokens = parsed.usage?.completion_tokens ?? null;
+  if (finishReason === "length" || !content) {
+    console.warn(
+      `[analysis] provider=${options.provider} model=${model} mode=${effectiveMode} finish_reason=${finishReason ?? "n/a"} completion_tokens=${completionTokens ?? "n/a"} reasoning_tokens=${reasoningTokens ?? "n/a"} reasoning_chars=${reasoningChars}`,
+    );
+  }
   if (!content) {
     // Marked EMPTY_RESPONSE so the fallback policy (and the final error
-    // summary) attributes it distinctly from a schema or validation failure.
+    // summary) attributes it distinctly from a schema or generation
+    // failure. The finish_reason/reasoning markers tell us whether the
+    // budget went to reasoning or the model truncated.
     throw new AppError("invalid_ai_output", `EMPTY_RESPONSE: ${providerLabel(options.provider)} returned an empty response.`, {
-      detail: `provider=${options.provider} model=${providerModel(options.provider)} mode=${effectiveMode} output_token_limit=${options.outputTokenLimit}`,
+      detail: `finish_reason=${finishReason ?? "n/a"} reasoning_tokens=${reasoningTokens ?? "n/a"} provider=${options.provider} model=${model} mode=${effectiveMode} output_token_limit=${options.outputTokenLimit} reasoning_chars=${reasoningChars}`,
       reason: "empty_response",
       retryable: true,
     });
@@ -504,20 +561,50 @@ async function callOpenAiCompatible(options: {
   return content;
 }
 
+type ProviderErrorBody = { code?: string; message?: string; failed_generation?: string | null };
+
+type Provider400Classification =
+  | { kind: "generation_failed"; code: string; message: string; failedGenerationChars: number | null }
+  | { kind: "schema_rejected" }
+  | { kind: "unsupported_format" }
+  | { kind: "unclassified" };
+
 /**
- * Classify a provider HTTP 400 received while using the strict json_schema
- * envelope. Deterministic schema/configuration problems are kept distinct
- * from everything else so the retry/fallback policy can treat them
- * differently (repair once, then fail fast — no provider burn-through).
+ * Classify a provider HTTP 400 by its error body, keeping the failure
+ * categories distinct so the retry/fallback policy can act on them
+ * differently:
+ *  - generation_failed: the schema was accepted but the model's
+ *    constrained generation failed (Groq code=json_validate_failed,
+ *    "Failed to validate/generate JSON"). Category B — a model/generation
+ *    problem, not a request/schema problem.
+ *  - schema_rejected: the request's schema or format was rejected.
+ *  - unsupported_format: the provider does not support the requested
+ *    structured-output mode at all.
  */
-function classifyStrictMode400(body: string): "schema_rejected" | "unsupported_format" | "unclassified" {
-  const text = body.toLowerCase();
+function classifyProvider400(body: string, mode: ResponseMode): Provider400Classification {
+  let parsed: ProviderErrorBody | null = null;
+  try {
+    const json: unknown = JSON.parse(body);
+    if (json && typeof json === "object") parsed = json as ProviderErrorBody;
+  } catch {
+    parsed = null;
+  }
+  const code = typeof parsed?.code === "string" ? parsed.code : "";
+  const message = typeof parsed?.message === "string" ? parsed.message : body;
+  const failedGenerationChars = typeof parsed?.failed_generation === "string" ? parsed.failed_generation.length : null;
+  const text = `${code} ${message} ${body.slice(0, 400)}`.toLowerCase();
+  if (
+    code === "json_validate_failed" ||
+    /failed to (validate|generate) json|generated json does not match/.test(text)
+  ) {
+    return { kind: "generation_failed", code, message, failedGenerationChars };
+  }
   if (
     text.includes("additionalproperties") ||
     text.includes("invalid json schema") ||
     (text.includes("json schema") && (text.includes("invalid") || text.includes("must be") || text.includes("unsupported")))
   ) {
-    return "schema_rejected";
+    return { kind: "schema_rejected" };
   }
   if (
     text.includes("does not support") ||
@@ -525,9 +612,12 @@ function classifyStrictMode400(body: string): "schema_rejected" | "unsupported_f
     text.includes("unknown field") ||
     (text.includes("response_format") && (text.includes("not supported") || text.includes("invalid value") || text.includes("unexpected") || text.includes("unknown")))
   ) {
-    return "unsupported_format";
+    return { kind: "unsupported_format" };
   }
-  return "unclassified";
+  if (mode === "json_schema" && (text.includes("response_format") || text.includes("schema"))) {
+    return { kind: "schema_rejected" };
+  }
+  return { kind: "unclassified" };
 }
 
 function toGeminiSchema(value: unknown): unknown {
@@ -536,10 +626,17 @@ function toGeminiSchema(value: unknown): unknown {
   return Object.fromEntries(
     Object.entries(value as Record<string, unknown>)
       .filter(([key]) => key !== "additionalProperties")
-      .map(([key, item]) => [
-        key,
-        key === "type" && typeof item === "string" ? item.toUpperCase() : toGeminiSchema(item),
-      ]),
+      .map(([key, item]) => {
+        if (key === "type" && typeof item === "string") return [key, item.toUpperCase()] as const;
+        // Gemini's OpenAPI-style responseSchema has no type unions: a
+        // nullable ["<t>", "null"] collapses to its base type (the field
+        // stays required, matching what the model already had to produce).
+        if (key === "type" && Array.isArray(item)) {
+          const base = item.find((t) => typeof t === "string" && t !== "null");
+          return [key, typeof base === "string" ? base.toUpperCase() : "STRING"] as const;
+        }
+        return [key, toGeminiSchema(item)] as const;
+      }),
   );
 }
 
@@ -571,15 +668,26 @@ async function callGemini(options: {
     throw describeHttpStatus(response.status, "Gemini analysis", text, retryAfterMilliseconds(response));
   }
   const parsed = await response.json() as {
-    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    candidates?: Array<{ finishReason?: string; content?: { parts?: Array<{ text?: string }> } }>;
     promptFeedback?: unknown;
+    usageMetadata?: { candidatesTokenCount?: number; thoughtsTokenCount?: number };
   };
-  const content = parsed.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("").trim();
+  const candidate = parsed.candidates?.[0];
+  const finishReason = candidate?.finishReason ?? null;
+  const thoughtsTokens = parsed.usageMetadata?.thoughtsTokenCount ?? null;
+  const candidatesTokens = parsed.usageMetadata?.candidatesTokenCount ?? null;
+  const content = candidate?.content?.parts?.map((part) => part.text || "").join("").trim();
+  if (!content || finishReason === "length") {
+    console.warn(
+      `[analysis] provider=gemini model=${config.geminiTextModel} mode=response_schema finish_reason=${finishReason ?? "n/a"} candidates_tokens=${candidatesTokens ?? "n/a"} thoughts_tokens=${thoughtsTokens ?? "n/a"}`,
+    );
+  }
   if (!content) {
     // Marked EMPTY_RESPONSE for the same fallback-policy attribution as the
-    // OpenAI-compatible providers.
+    // OpenAI-compatible providers. Gemini thinking models burn their budget
+    // on thoughts first — the markers show whether that happened.
     throw new AppError("invalid_ai_output", "EMPTY_RESPONSE: Gemini returned an empty analysis response.", {
-      detail: `provider=gemini model=${config.geminiTextModel} mode=response_schema output_token_limit=${options.outputTokenLimit} prompt_feedback=${JSON.stringify(parsed.promptFeedback ?? parsed).slice(0, 300)}`,
+      detail: `finish_reason=${finishReason ?? "n/a"} thoughts_tokens=${thoughtsTokens ?? "n/a"} provider=gemini model=${config.geminiTextModel} mode=response_schema output_token_limit=${options.outputTokenLimit} prompt_feedback=${JSON.stringify(parsed.promptFeedback ?? parsed).slice(0, 200)}`,
       reason: "empty_response",
       retryable: true,
     });
@@ -690,6 +798,10 @@ export function extractJson(content: string): unknown {
   throw new AppError("invalid_ai_output", "The AI response did not contain usable JSON.", {
     detail: trimmed.slice(0, 600),
     retryable: true,
+    // Unusable JSON is a GENERATION problem (the model wrote prose or
+    // truncated output) — not a final schema-validation failure. The two
+    // are kept distinct for attribution and retry policy.
+    reason: "invalid_json",
   });
 }
 
@@ -1330,17 +1442,21 @@ function attemptFailureReason(error: unknown): string {
  * next configured provider — the same behavior as the discovery fallback
  * flow. Providers are tried sequentially, never in parallel.
  *
- * Failure classification drives the retry/fallback policy:
- *  - TRANSIENT (429/500-504, timeouts, EMPTY_RESPONSE, validation failures)
- *    → move to the next provider; 5xx additionally records a bounded
- *    exponential backoff on the overloaded provider (2s → 15s cap).
- *  - DETERMINISTIC schema/configuration errors (pre-flight invalid schema,
- *    provider HTTP 400 rejecting the schema, unsupported strict mode) →
- *    repair/normalize the schema, at most ONE retry (or one downgrade to
- *    json_object), then fail fast with a clear configuration error instead
- *    of burning the remaining providers with the same schema.
- * The final error is a structured `All providers exhausted.` summary with one
- * attributable line per provider (never API keys or secrets).
+ * Bounded provider-chain policy (ANALYSIS_CHAIN_PASSES, default 2):
+ *  - Pass 1 walks every configured provider exactly once (a provider is
+ *    never retried repeatedly inside one pass). 5xx additionally records a
+ *    bounded exponential backoff on the overloaded provider (2s → 15s cap).
+ *  - Pass 2 runs ONLY when pass 1's failures are deterministic schema
+ *    problems (one bounded repair pass: schema was already normalized +
+ *    validated pre-flight; strict-mode providers retry in json_object) or
+ *    transient overload (one bounded retry pass after backoff).
+ *  - All-persistent failures (generation/empty/validation) stop the chain.
+ * Failure categories kept distinct for attribution and policy:
+ * SCHEMA_REQUEST_INVALID, STRUCTURED_GENERATION_FAILED, EMPTY_RESPONSE,
+ * TRANSIENT_PROVIDER_ERROR, UNSUPPORTED_STRUCTURED_OUTPUT,
+ * PROVIDER_UNAVAILABLE. The final error is a structured
+ * `All providers exhausted.` summary with one attributable line per provider
+ * (never API keys or secrets).
  *
  * Everything is best-effort for callers: catch the AppError and fall back.
  */
@@ -1362,34 +1478,68 @@ export async function requestStructuredJson(options: {
   /** Test hook: replaces the real provider call (never set in production). */
   callOverride?: CallProviderOverride;
 }): Promise<StructuredJsonResult> {
-  const outputTokenLimit = Math.max(128, Math.min(2_000, Math.round(options.outputTokenLimit ?? 400)));
+  const outputTokenLimit = Math.max(128, Math.min(4_096, Math.round(options.outputTokenLimit ?? 400)));
   const providers = configuredProviders(options.user, outputTokenLimit);
   if (!providers.length) {
     throw new AppError("invalid_ai_output", "No suitable AI provider is configured for this request.", {
       status: 503,
     });
   }
-  const failures: string[] = [];
-  let failFast: string | undefined;
-  for (const provider of providers) {
-    const model = providerModel(provider);
-    // Bounded per-provider policy for DETERMINISTIC errors (they are NOT
-    // retried like transient ones):
-    //  - invalid_schema (pre-flight audit): no request was made; fail fast
-    //    with a clear configuration error instead of walking the remaining
-    //    providers with the same invalid schema.
-    //  - schema_rejected (provider HTTP 400): the schema was normalized
-    //    before the first request; exactly ONE retry is allowed, after which
-    //    the request fails fast as a configuration error.
-    //  - unsupported_format (provider HTTP 400): one downgrade to the looser
-    //    json_object mode (a different request, not a repeat), then continue.
-    // Transient failures (429/5xx/timeout), EMPTY_RESPONSE and validation
-    // failures always move straight to the next provider.
-    let mode = options.mode ?? "json_object";
-    let deterministicUsed = false;
-    let providerDone = false;
-    while (!providerDone) {
-      const callInput = { system: options.system, user: options.user, mode, schema: options.schema, outputTokenLimit };
+  // Task 3: when a STRICT schema is requested, validate the FINAL provider
+  // schema LOCALLY before touching any provider. An invalid schema is a
+  // configuration error (schema_validation_error) and must fail fast — it is
+  // NEVER sent to Groq, and it must not be papered over by silently falling
+  // back to json_object (which would mask the schema bug). Normalization is
+  // applied first, so only genuinely unexpressible schemas (anyOf/$ref/…)
+  // reach this guard.
+  if ((options.mode ?? "json_object") === "json_schema") {
+    const normalized = normalizeStrictSchema(options.schema);
+    if (!normalized.schema) {
+      throw new AppError("bad_request", "Request not sent: the strict JSON schema cannot be expressed for structured output.", {
+        detail: `schema_validation_error (local final-schema validation): ${normalized.hardIssues.slice(0, 5).map((issue) => `${issue.path}: ${issue.message}`).join("; ")}`,
+        status: 500,
+        reason: "schema_request_invalid",
+      });
+    }
+    const finalCheck = validateFinalStrictSchema(normalized.schema);
+    if (!finalCheck.ok) {
+      throw new AppError("bad_request", "Request not sent: the final strict JSON schema failed local validation.", {
+        detail: `schema_validation_error (local final-schema validation): ${finalCheck.issues.slice(0, 5).map((issue) => `${issue.path}: ${issue.message}`).join("; ")}`,
+        status: 500,
+        reason: "schema_request_invalid",
+      });
+    }
+  }
+  // Bounded provider-chain model (ANALYSIS_CHAIN_PASSES, default 2):
+  //  Pass 1 walks every configured provider EXACTLY ONCE (in ANALYSIS_PROVIDERS
+  //  order). A provider is never retried repeatedly inside one pass.
+  //  Pass 2 (the final pass by default) runs ONLY when pass 1's failures are:
+  //   - deterministic schema problems (SCHEMA_REQUEST_INVALID /
+  //     UNSUPPORTED_STRUCTURED_OUTPUT) → repair pass: the schema was already
+  //     normalized+validated pre-flight, and strict-mode providers retry in
+  //     the looser json_object mode (a different request, not a repeat); or
+  //   - transient overload (429/5xx/timeout) → one bounded retry pass after
+  //     the per-provider backoff has elapsed.
+  //  All-persistent failures (STRUCTURED_GENERATION_FAILED / EMPTY_RESPONSE /
+  //  validation) STOP the chain — no endless provider cycling. A single
+  //  request can therefore consume at most maxPasses × providers calls.
+  const maxPasses = config.analysisChainPasses;
+  const failures: ChainFailure[] = [];
+  for (let pass = 1; pass <= maxPasses; pass++) {
+    const passMode: ResponseMode = pass === 1 ? (options.mode ?? "json_object") : "json_object";
+    const passUser = pass === 1
+      ? options.user
+      : `${options.user}\n\nCORRECTION: Your previous response was not usable. Return ONLY one complete valid JSON object that exactly matches the requested shape — no markdown, no trailing commas, no text outside the JSON.`;
+    let sawTransient = false;
+    let sawSchema = false;
+    for (const provider of providers) {
+      const model = providerModel(provider);
+      if (providerTemporarilyUnavailable(provider)) {
+        options.onAttempt?.({ provider, model, outcome: "failed", reason: "blocked", pass, category: "PROVIDER_UNAVAILABLE" });
+        failures.push({ provider, model, pass, category: "PROVIDER_UNAVAILABLE", reason: "blocked", message: "unavailable for the remainder of this job" });
+        continue;
+      }
+      const callInput = { system: options.system, user: passUser, mode: passMode, schema: options.schema, outputTokenLimit };
       try {
         const content = options.callOverride
           ? await options.callOverride(provider, callInput)
@@ -1400,56 +1550,86 @@ export async function requestStructuredJson(options: {
           } catch (error) {
             const reason = error instanceof AppError ? (error.reason ?? "schema_validation") : attemptFailureReason(error);
             const message = error instanceof AppError || error instanceof Error ? error.message : String(error);
-            options.onAttempt?.({ provider, model, outcome: "failed", reason });
-            failures.push(failureLine(provider, reason, message));
-            console.warn(`[analysis] structured-json provider=${provider} model=${model} rejected reason=${reason} detail=${message.slice(0, 300)}`);
-            providerDone = true; // not successful → try the next provider
-            break;
+            const category = failureCategory(reason);
+            options.onAttempt?.({ provider, model, outcome: "failed", reason, pass, category });
+            failures.push({ provider, model, pass, category, reason, message });
+            console.warn(`[analysis] structured-json provider=${provider} model=${model} pass=${pass} rejected category=${category} reason=${reason} detail=${message.slice(0, 300)}`);
+            continue; // not successful → try the next provider
           }
         }
         noteProviderSuccess(provider);
-        options.onAttempt?.({ provider, model, outcome: "passed" });
+        options.onAttempt?.({ provider, model, outcome: "passed", pass });
         return { content, provider, model };
       } catch (error) {
         const appError = error instanceof AppError ? error : new AppError("invalid_ai_output", (error as Error).message, { retryable: true });
         const reason = attemptFailureReason(error);
         const message = `${appError.message}${appError.detail ? ` — ${appError.detail.slice(0, 200)}` : ""}`;
-        options.onAttempt?.({ provider, model, outcome: "failed", reason });
-        console.warn(`[analysis] structured-json provider=${provider} model=${model} failed reason=${reason} detail=${message}`);
+        const category = failureCategory(reason, appError.providerStatus);
+        if (category === "TRANSIENT_PROVIDER_ERROR") sawTransient = true;
+        if (category === "SCHEMA_REQUEST_INVALID" || category === "UNSUPPORTED_STRUCTURED_OUTPUT") sawSchema = true;
+        options.onAttempt?.({ provider, model, outcome: "failed", reason, pass, category });
+        failures.push({ provider, model, pass, category, reason, message });
+        console.warn(`[analysis] structured-json provider=${provider} model=${model} pass=${pass} failed category=${category} reason=${reason} detail=${message}`);
         noteProviderOverload(provider, appError.providerStatus);
         if (appError.providerStatus === 429) setProviderCooldown(provider, Math.max(1_000, appError.retryAfterMs ?? 0));
         if (appError.providerStatus === 401 || appError.providerStatus === 403) blockProvider(provider, 5 * 60_000);
-
-        if (reason === "invalid_schema" || (reason === "schema_rejected" && deterministicUsed)) {
-          // Still invalid after the single allowed retry (or invalid before
-          // any request) → deterministic configuration error. Fail fast: do
-          // NOT burn the remaining providers with the same schema.
-          failures.push(failureLine(provider, "invalid_schema", message));
-          failFast = "invalid_schema";
-          providerDone = true;
-        } else if (reason === "schema_rejected") {
-          deterministicUsed = true;
-          console.warn(`[analysis] structured-json provider=${provider} model=${model} schema_rejected — retrying once with normalized schema`);
-        } else if (reason === "unsupported_format") {
-          if (!deterministicUsed) {
-            // One downgrade to the looser json_object mode — not a repeated
-            // retry of the same strict request.
-            deterministicUsed = true;
-            mode = "json_object";
-            console.warn(`[analysis] structured-json provider=${provider} model=${model} unsupported_format — downgrading to json_object`);
-          } else {
-            failures.push(failureLine(provider, "unsupported_format", message));
-            providerDone = true;
-          }
-        } else {
-          failures.push(failureLine(provider, reason, message));
-          providerDone = true; // transient / empty / validation → next provider
-        }
       }
     }
-    if (failFast) break;
+    if (pass === maxPasses) break;
+    // Classification decides whether the bounded retry/repair pass runs.
+    if (sawSchema) {
+      console.warn("[analysis] structured-json chain: deterministic schema failure — running ONE bounded repair pass (schema normalized pre-flight; strict-mode providers retry in json_object)");
+      continue;
+    }
+    if (sawTransient) {
+      console.warn("[analysis] structured-json chain: transient provider failure — running ONE bounded retry pass (overloaded providers back off first)");
+      continue;
+    }
+    break; // every failure was persistent — stop, do not cycle providers
   }
-  throw new AppError("invalid_ai_output", exhaustionSummary(failures), { status: 502, reason: failFast });
+  throw new AppError("invalid_ai_output", exhaustionSummary(failures), { status: 502 });
+}
+
+type ChainFailure = {
+  provider: string;
+  model: string;
+  pass: number;
+  category: string;
+  reason: string;
+  message: string;
+};
+
+/**
+ * Failure category for retry/fallback decisions. The categories are kept
+ * deliberately distinct — they drive different policy:
+ *  - SCHEMA_REQUEST_INVALID: the request's schema/format was rejected (local
+ *    pre-flight or provider HTTP 400) → one bounded repair pass.
+ *  - STRUCTURED_GENERATION_FAILED: the schema was accepted but the model's
+ *    output was unusable (json_validate_failed, malformed JSON, final
+ *    validation failure) → persistent; the looser mode/next provider may
+ *    still work, but the same strict request will not.
+ *  - EMPTY_RESPONSE: HTTP 200 with no content (often a reasoning model that
+ *    spent its budget thinking) → persistent.
+ *  - TRANSIENT_PROVIDER_ERROR: 429/500-504/timeout → one bounded retry pass.
+ *  - UNSUPPORTED_STRUCTURED_OUTPUT: the provider cannot do the requested mode.
+ *  - PROVIDER_UNAVAILABLE: auth/credits block (401-404).
+ */
+function failureCategory(reason: string, providerStatus?: number): string {
+  if (reason === "schema_request_invalid") return "SCHEMA_REQUEST_INVALID";
+  if (reason === "unsupported_structured_output") return "UNSUPPORTED_STRUCTURED_OUTPUT";
+  if (reason === "empty_response") return "EMPTY_RESPONSE";
+  if (reason === "structured_generation_failed" || reason === "invalid_json" || reason === "schema_validation" || reason === "invalid_segment") {
+    return "STRUCTURED_GENERATION_FAILED";
+  }
+  if (reason === "blocked") return "PROVIDER_UNAVAILABLE";
+  if (reason === "timeout") return "TRANSIENT_PROVIDER_ERROR";
+  if (typeof providerStatus === "number") {
+    if (providerStatus === 429 || (providerStatus >= 500 && providerStatus <= 504)) return "TRANSIENT_PROVIDER_ERROR";
+    if (providerStatus >= 401 && providerStatus <= 404) return "PROVIDER_UNAVAILABLE";
+    if (providerStatus === 400) return "SCHEMA_REQUEST_INVALID"; // deterministic rejection (unclassified 400)
+    return "TRANSIENT_PROVIDER_ERROR";
+  }
+  return "STRUCTURED_GENERATION_FAILED"; // unknown local failure → treat as persistent
 }
 
 /** Short human-facing label for a failure reason in the exhaustion summary. */
@@ -1462,14 +1642,15 @@ function failureReasonLabel(reason: string): string {
     return `http ${code} rejected`;
   }
   switch (reason) {
-    case "empty_response": return "empty_response";
-    case "schema_validation": return "schema_validation_error";
-    case "schema_rejected": return "schema_rejected_by_provider";
-    case "invalid_schema": return "invalid_schema (configuration)";
-    case "unsupported_format": return "structured_output_unsupported";
+    case "empty_response": return "empty response";
+    case "structured_generation_failed": return "structured generation failed";
+    case "schema_validation": return "response failed final schema validation";
+    case "schema_request_invalid": return "request schema invalid";
+    case "unsupported_structured_output": return "structured output mode unsupported";
     case "timeout": return "timeout";
-    case "invalid_json": return "invalid_json";
-    case "invalid_segment": return "invalid_segment";
+    case "invalid_json": return "response was not valid JSON";
+    case "invalid_segment": return "no usable segments in response";
+    case "blocked": return "provider blocked (auth/credits)";
     default: return reason;
   }
 }
@@ -1482,19 +1663,26 @@ function sanitizeFailureDetail(detail: string): string {
     .slice(0, 160);
 }
 
-function failureLine(provider: string, reason: string, message: string): string {
-  const detail = sanitizeFailureDetail(message);
-  return detail ? `${provider}: ${failureReasonLabel(reason)} — ${detail}` : `${provider}: ${failureReasonLabel(reason)}`;
-}
-
 /**
  * Structured per-provider failure summary: `All providers exhausted.` plus
- * one attributable line per provider (e.g. `gemini: 503 transient provider
- * unavailable`, `openrouter: empty_response`, `groq: schema_validation_error`).
+ * one attributable line per provider (first failure wins), e.g.
+ *   - gemini: TRANSIENT_PROVIDER_ERROR — 503 transient provider unavailable
+ *   - openrouter: EMPTY_RESPONSE — empty response
+ *   - groq: STRUCTURED_GENERATION_FAILED — structured generation failed …
  * Never contains API keys or secrets.
  */
-function exhaustionSummary(failures: string[]): string {
-  return failures.length
-    ? `All providers exhausted.\n${failures.map((line) => `  - ${line}`).join("\n")}`
-    : "All providers exhausted.";
+function exhaustionSummary(failures: ChainFailure[]): string {
+  const firstByProvider = new Map<string, ChainFailure>();
+  const attemptCount = new Map<string, number>();
+  for (const failure of failures) {
+    if (!firstByProvider.has(failure.provider)) firstByProvider.set(failure.provider, failure);
+    attemptCount.set(failure.provider, (attemptCount.get(failure.provider) ?? 0) + 1);
+  }
+  if (!firstByProvider.size) return "All providers exhausted.";
+  const lines = [...firstByProvider.entries()].map(([provider, failure]) => {
+    const detail = sanitizeFailureDetail(`${failureReasonLabel(failure.reason)} — ${failure.message}`);
+    const attempts = attemptCount.get(provider) ?? 1;
+    return `  - ${provider}: ${failure.category} — ${detail}${attempts > 1 ? ` (${attempts} bounded attempts)` : ""}`;
+  });
+  return `All providers exhausted.\n${lines.join("\n")}`;
 }

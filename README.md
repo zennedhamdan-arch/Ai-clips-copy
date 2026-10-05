@@ -198,7 +198,14 @@ ANALYSIS_TRANSCRIPT_MAX_CHARS=12000
 ANALYSIS_CHUNK_MAX_SECONDS=600
 ANALYSIS_CHUNK_OVERLAP_SEC=30
 ANALYSIS_GROQ_SAFE_CHARS=14000
+ANALYSIS_CHAIN_PASSES=2
+ANALYSIS_STORY_OUTPUT_TOKENS=2048
+GROQ_REASONING_EFFORT=low
 ```
+
+**Structured-output reliability.** Every strict `json_schema` request goes through one shared schema layer (`src/lib/strict-schema.ts`): the schema is normalized recursively (`additionalProperties:false` on every object, every declared property listed in `required`, conceptually-optional fields promoted to nullable `["<t>","null"]` so the model emits `null` instead of inventing values) and the **final** provider schema is validated locally — an invalid schema is never sent to a provider. Provider failures are classified before any retry decision: `SCHEMA_REQUEST_INVALID`, `STRUCTURED_GENERATION_FAILED` (schema accepted but the model's constrained generation failed, e.g. Groq `json_validate_failed`), `EMPTY_RESPONSE` (HTTP 200 with no content — a reasoning model that spent its budget thinking), `TRANSIENT_PROVIDER_ERROR` (429/5xx/timeout, with bounded exponential backoff), `UNSUPPORTED_STRUCTURED_OUTPUT`, `PROVIDER_UNAVAILABLE`. The provider chain is bounded (`ANALYSIS_CHAIN_PASSES`, default 2): pass 1 tries every configured provider exactly once; one additional pass runs only for deterministic schema or transient failures. A story part can therefore never consume unbounded provider calls.
+
+Groq `openai/gpt-oss-*` is a reasoning model: its hidden reasoning tokens are drawn from the same `max_tokens` budget as the JSON answer. Requests therefore send `reasoning_effort` (`GROQ_REASONING_EFFORT`, default `low`) and story analysis uses a larger output budget (`ANALYSIS_STORY_OUTPUT_TOKENS`, default 2048) so the constrained JSON fits — this is what fixes Groq `400 json_validate_failed` with an empty `failed_generation`. Empty responses are logged with `finish_reason` / reasoning-token markers so a reasoning-budget exhaustion is diagnosable from the logs alone.
 
 Timestamped transcript segments are split primarily by a conservative token estimate, with character/time limits as secondary guards and a small duration-aware overlap. The default 4,500-token input ceiling reserves 1,000 tokens for instructions, leaving roughly 3,500 estimated transcript tokens per discovery part. Discovery runs independently on every part; long videos then receive a compact global candidate-ranking pass. Output is capped at 1,200 tokens for discovery and 700 for ranking instead of 4,096.
 

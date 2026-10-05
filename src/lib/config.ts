@@ -119,6 +119,23 @@ export const config = {
   analysisChunkOverlapSec: num("ANALYSIS_CHUNK_OVERLAP_SEC", 30),
   analysisChunkMaxSec: num("ANALYSIS_CHUNK_MAX_SECONDS", 600),
   analysisGroqSafeChars: num("ANALYSIS_GROQ_SAFE_CHARS", 14_000),
+  /**
+   * Bounded provider-chain passes for one structured-JSON request (1-3).
+   * Pass 1 walks every configured provider once; a second pass runs only
+   * when pass 1's failures are deterministic schema problems or transient
+   * overload. A single story part can never consume more than
+   * maxPasses × providers provider calls.
+   */
+  analysisChainPasses: Math.max(1, Math.min(3, num("ANALYSIS_CHAIN_PASSES", 2))),
+  /**
+   * Output budget for story-part analysis. Reasoning models (gpt-oss,
+   * gemini-2.5-flash) draw their hidden reasoning tokens from the same
+   * max_tokens budget as the JSON answer, so this must leave headroom for
+   * both, or Groq fails with json_validate_failed and empty responses.
+   */
+  analysisStoryOutputTokens: num("ANALYSIS_STORY_OUTPUT_TOKENS", 2_048),
+  /** Groq gpt-oss models: reasoning budget (minimal|low|medium|high). */
+  groqReasoningEffort: str("GROQ_REASONING_EFFORT", "low"),
 
   /** Shared audio layer (TTS narration + music/SFX) ------------------------ */
   /** Provider order for narration. mock is only honored when AUDIO_MOCK=1. */
