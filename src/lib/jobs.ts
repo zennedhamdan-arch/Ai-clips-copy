@@ -15,8 +15,9 @@ import {
 import { checkR2, deleteObjects, deletePendingMusicOlderThan, headObject, sourceObjectKey } from "./object-storage";
 import { normalizeOutputFormat, type OutputFormat } from "./output-format";
 import { normalizeAssetIds, normalizeMediaMode, resolveJobAssets, type MediaMode } from "./media-library";
-import type { ApiJob, JobStatus, Stage } from "./types";
-import { STAGE_LABELS } from "./types";
+import { deleteJobPrefix } from "./object-storage";
+import type { ApiJob, DocumentaryScene, ExplainerScript, JobMode, JobStatus, Stage } from "./types";
+import { STAGE_LABELS, normalizeJobMode } from "./types";
 
 type QueueState = {
   pending: string[];
@@ -244,6 +245,9 @@ export async function runCleanup(): Promise<{ removedJobs: number; removedDirs: 
       // Delete the source last. If any output cleanup fails, the durable source
       // remains available and the database keeps every object reference.
       await deleteObjects(outputObjectKeys, "completed-job-retention-expired-output");
+      await deleteJobPrefix(removableJob.id, "completed-job-retention-expired-job-prefix").catch((error) => {
+        console.warn(`[R2 cleanup] job=${removableJob.id} prefix sweep skipped: ${(error as Error).message}`);
+      });
       await deleteObjects([claimed[0].sourceKey], "completed-job-retention-expired-source");
       await db.delete(jobs).where(and(eq(jobs.id, removableJob.id), eq(jobs.status, "cleanup_pending")));
       removedIds.push(removableJob.id);
@@ -281,7 +285,7 @@ export function startCleanupScheduler(): void {
 
 export type CreateJobInput = {
   id?: string;
-  sourceType: "upload" | "direct_url" | "dropbox" | "google_drive" | "url";
+  sourceType: "upload" | "direct_url" | "dropbox" | "google_drive" | "url" | "idea";
   sourceName: string;
   sourceUrl?: string | null;
   filePath?: string | null;
@@ -297,11 +301,27 @@ export type CreateJobInput = {
   mediaMode?: MediaMode;
   musicAssetIds?: string[];
   soundEffectAssetIds?: string[];
+  /** Pipeline mode (default "clips" = the original Video -> Shorts flow). */
+  mode?: JobMode;
+  /** Documentary idea/topic (mode = documentary). */
+  topic?: string | null;
+  /** Optional pasted source material for the documentary research stage. */
+  topicText?: string | null;
+  /** Target narration length for movie/documentary jobs. */
+  targetSec?: number | null;
 };
 
 export async function createJob(input: CreateJobInput): Promise<string> {
   await ensureRuntime();
   await assertDiskSpace();
+
+  const mode = normalizeJobMode(input.mode);
+  if (mode === "documentary" && input.sourceType !== "idea") {
+    throw new AppError("bad_request", "Documentary jobs are created from an idea/topic, not a video source.", { status: 400 });
+  }
+  if (mode === "documentary" && !input.topic?.trim()) {
+    throw new AppError("bad_request", "A topic is required for documentary jobs.", { status: 400 });
+  }
 
   const requestedClips = Math.min(
     config.maxClipCount,
@@ -311,6 +331,9 @@ export async function createJob(input: CreateJobInput): Promise<string> {
     config.maxClipSec,
     Math.max(config.minClipSec, Math.round(input.maxClipSec ?? 45)),
   );
+  const targetSec = input.targetSec !== undefined && input.targetSec !== null
+    ? Math.max(30, Math.min(300, Math.round(input.targetSec)))
+    : null;
 
   const mediaMode = normalizeMediaMode(input.mediaMode);
   const id = input.id ?? `job_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -350,8 +373,9 @@ export async function createJob(input: CreateJobInput): Promise<string> {
       id,
       status: "queued",
       stage: "queued",
+      mode,
       sourceType: input.sourceType,
-      sourceName: input.sourceName.slice(0, 200),
+      sourceName: (mode === "documentary" ? (input.topic?.trim() ?? "Documentary") : input.sourceName).slice(0, 200),
       sourceUrl: input.sourceUrl ?? null,
       filePath: input.filePath ?? null,
       sourceObjectKey: authoritativeSourceKey,
@@ -364,6 +388,9 @@ export async function createJob(input: CreateJobInput): Promise<string> {
       musicObjectKey: input.musicObjectKey ?? null,
       musicFileName: input.musicFileName?.slice(0, 200) ?? null,
       mediaMode,
+      topic: input.topic?.trim().slice(0, 200) || null,
+      topicText: input.topicText?.trim().slice(0, 30_000) || null,
+      targetSec,
       workDir: jobRoot(id),
       expiresAt: new Date(Date.now() + config.retentionHours * 3600 * 1000),
     });
@@ -379,14 +406,52 @@ export async function createJob(input: CreateJobInput): Promise<string> {
       jobId: id,
       stage: "queued",
       message:
-        input.sourceType !== "upload"
-          ? `${input.sourceType.replace("_", " ")} job queued: ${input.sourceUrl}`
-          : `Job queued for upload: ${input.sourceName} (${((authoritativeSourceSize ?? 0) / (1024 * 1024)).toFixed(1)}MB), sourceObjectKey=${authoritativeSourceKey}`,
+        mode === "documentary"
+          ? `Documentary job queued: ${input.topic?.trim()}`
+          : input.sourceType !== "upload"
+            ? `${input.sourceType.replace("_", " ")} job queued: ${input.sourceUrl}`
+            : `Job queued for upload: ${input.sourceName} (${((authoritativeSourceSize ?? 0) / (1024 * 1024)).toFixed(1)}MB), sourceObjectKey=${authoritativeSourceKey}`,
     });
   });
   console.info(`[job create] job=${id} sourceType=${input.sourceType} sourceObjectKey=${authoritativeSourceKey ?? "none"}`);
   enqueue(id);
   return id;
+}
+
+/** UI-safe summaries of the movie/documentary checkpoint documents. */
+function mapJobExtras(job: typeof jobs.$inferSelect): Pick<ApiJob, "mode" | "topic" | "targetSec" | "script" | "scenes"> {
+  const script = job.script as ExplainerScript | null;
+  const scenes = Array.isArray(job.scenes) ? (job.scenes as DocumentaryScene[]) : null;
+  return {
+    mode: normalizeJobMode(job.mode),
+    topic: job.topic,
+    targetSec: job.targetSec,
+    script: script && script.version === 1 && Array.isArray(script.sections)
+      ? {
+          title: script.title,
+          logline: script.logline,
+          sections: script.sections.map((section) => ({
+            heading: section.heading,
+            title: section.title,
+            narration: section.narration,
+            sceneStartSec: section.sceneStartSec,
+            sceneEndSec: section.sceneEndSec,
+            narrationSec: section.narrationSec,
+            audioStatus: section.audioStatus,
+          })),
+        }
+      : null,
+    scenes: scenes
+      ? scenes.map((scene) => ({
+          index: scene.index,
+          heading: scene.heading,
+          targetSec: scene.targetSec,
+          visualPrompt: scene.visualPrompt,
+          assetStatus: scene.assetStatus,
+          audioStatus: scene.audio?.status ?? "pending",
+        }))
+      : null,
+  };
 }
 
 function mapClip(row: typeof clips.$inferSelect) {
@@ -447,6 +512,7 @@ export async function getJob(jobId: string): Promise<ApiJob | null> {
     stageLabel: STAGE_LABELS[job.stage as Stage] ?? job.stage,
     stageDetail: job.stageDetail,
     progress: job.progress,
+    ...mapJobExtras(job),
     sourceType: job.sourceType,
     sourceName: job.sourceName,
     durationSec: job.durationSec,
@@ -503,6 +569,7 @@ export async function listJobs(limit = 12): Promise<ApiJob[]> {
     stageLabel: STAGE_LABELS[job.stage as Stage] ?? job.stage,
     stageDetail: job.stageDetail,
     progress: job.progress,
+    ...mapJobExtras(job),
     sourceType: job.sourceType,
     sourceName: job.sourceName,
     durationSec: job.durationSec,
@@ -547,6 +614,9 @@ export async function deleteJob(jobId: string): Promise<void> {
   // Keep database references unless all idempotent deletes succeed, and delete
   // the source last so a failure removing outputs cannot destroy retry data.
   await deleteObjects(outputObjectKeys, "user-deleted-job-output");
+  await deleteJobPrefix(jobId, "user-deleted-job-prefix").catch((error) => {
+    console.warn(`[R2 cleanup] job=${jobId} prefix sweep skipped: ${(error as Error).message}`);
+  });
   await deleteObjects([job.sourceObjectKey], "user-deleted-job-source");
   await db.delete(jobs).where(eq(jobs.id, jobId));
   await removePath(jobRoot(jobId));

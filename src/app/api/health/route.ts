@@ -36,11 +36,25 @@ export async function GET() {
       gemini: providers.gemini ? "configured" : "missing GEMINI_API_KEY or GEMINI_TEXT_MODEL",
       groq: providers.groq ? "configured" : "missing GROQ_API_KEY",
       openrouter: providers.openrouter ? "configured" : "missing OPENROUTER_API_KEY",
+      nvidia: providers.nvidia ? "configured" : "missing NVIDIA_API_KEY (optional additional provider)",
       order: providers.order,
     };
     if (!providers.order.length) ok = false;
   } catch (error) {
     checks.providers = `error: ${(error as Error).message}`;
+  }
+
+  // Shared audio layer (narration TTS + music). Optional: the clips pipeline
+  // does not require it, the movie/documentary modes do (or fall back to mock).
+  try {
+    const { audioProviderStatus } = await import("@/lib/audio/router");
+    const audio = audioProviderStatus();
+    checks.audio = {
+      tts: audio.tts,
+      music: audio.music,
+    };
+  } catch (error) {
+    checks.audio = `error: ${(error as Error).message}`;
   }
 
   checks.temporaryStorage = storageRoot();

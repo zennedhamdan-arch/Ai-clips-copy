@@ -93,11 +93,16 @@ export const config = {
   // Keep model IDs environment-configurable: account/model access can differ.
   groqTextModel: str("GROQ_TEXT_MODEL", "openai/gpt-oss-20b"),
   openrouterTextModel: str("OPENROUTER_TEXT_MODEL", "google/gemini-2.5-flash"),
-  /** Direct Gemini first, then OpenRouter, then Groq. */
-  analysisProviders: str("ANALYSIS_PROVIDERS", "gemini,openrouter,groq")
-    .split(",")
-    .map((p) => p.trim().toLowerCase())
-    .filter((p) => p === "gemini" || p === "groq" || p === "openrouter"),
+  /**
+   * NVIDIA NIM is an ADDITIONAL OpenAI-compatible provider (not the
+   * foundation). It is only used when ANALYSIS_PROVIDERS lists "nvidia" and
+   * both NVIDIA_API_KEY and NVIDIA_TEXT_MODEL are set.
+   */
+  nvidiaApiKey: process.env.NVIDIA_API_KEY?.trim() || "",
+  nvidiaBaseUrl: str("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
+  nvidiaTextModel: str("NVIDIA_TEXT_MODEL", "meta/llama-3.3-70b-instruct"),
+  /** Direct Gemini first, then OpenRouter, Groq, then NVIDIA. */
+  analysisProviders: parseAnalysisProviderList(str("ANALYSIS_PROVIDERS", "gemini,openrouter,groq,nvidia")),
   analysisTimeoutSec: num("ANALYSIS_TIMEOUT_SEC", 180),
   /** One controlled retry for transient or repairable provider failures. */
   analysisMaxRetries: num("ANALYSIS_MAX_RETRIES", 1),
@@ -114,6 +119,56 @@ export const config = {
   analysisChunkOverlapSec: num("ANALYSIS_CHUNK_OVERLAP_SEC", 30),
   analysisChunkMaxSec: num("ANALYSIS_CHUNK_MAX_SECONDS", 600),
   analysisGroqSafeChars: num("ANALYSIS_GROQ_SAFE_CHARS", 14_000),
+  /**
+   * Bounded provider-chain passes for one structured-JSON request (1-3).
+   * Pass 1 walks every configured provider once; a second pass runs only
+   * when pass 1's failures are deterministic schema problems or transient
+   * overload. A single story part can never consume more than
+   * maxPasses × providers provider calls.
+   */
+  analysisChainPasses: Math.max(1, Math.min(3, num("ANALYSIS_CHAIN_PASSES", 2))),
+  /**
+   * Output budget for story-part analysis. Reasoning models (gpt-oss,
+   * gemini-2.5-flash) draw their hidden reasoning tokens from the same
+   * max_tokens budget as the JSON answer, so this must leave headroom for
+   * both, or Groq fails with json_validate_failed and empty responses.
+   */
+  analysisStoryOutputTokens: num("ANALYSIS_STORY_OUTPUT_TOKENS", 2_048),
+  /** Groq gpt-oss models: reasoning budget (minimal|low|medium|high). */
+  groqReasoningEffort: str("GROQ_REASONING_EFFORT", "low"),
+
+  /** Shared audio layer (TTS narration + music/SFX) ------------------------ */
+  /** Provider order for narration. mock is only honored when AUDIO_MOCK=1. */
+  audioTtsProviders: parseAudioProviderList(str("AUDIO_TTS_PROVIDERS", "gemini,openai"), ["gemini", "openai", "mock"]),
+  /** Provider order for generated background music. B2 Music Library first. */
+  audioMusicProviders: parseAudioProviderList(str("AUDIO_MUSIC_PROVIDERS", "b2,freetouse"), ["b2", "freetouse", "mock"]),
+  /** Testing-only offline provider; never enabled in production by default. */
+  audioMockEnabled: bool("AUDIO_MOCK", false),
+  audioRequestTimeoutSec: num("AUDIO_REQUEST_TIMEOUT_SEC", 180),
+  /** Hard cap for music downloads (30 MB). */
+  audioMaxMusicBytes: 30 * 1024 * 1024,
+  /** Gemini TTS reuses the existing GEMINI_API_KEY integration. */
+  ttsGeminiModel: str("TTS_GEMINI_MODEL", "gemini-2.5-flash-preview-tts"),
+  ttsGeminiVoice: str("TTS_GEMINI_VOICE", "Puck"),
+  /** OpenAI-compatible TTS (real, documented /audio/speech endpoint). */
+  openaiApiKey: process.env.OPENAI_API_KEY?.trim() || "",
+  openaiTtsBaseUrl: str("OPENAI_TTS_BASE_URL", "https://api.openai.com/v1"),
+  openaiTtsModel: str("OPENAI_TTS_MODEL", "tts-1"),
+  openaiTtsVoice: str("OPENAI_TTS_VOICE", "alloy"),
+  /** Free To Use public music library (no API key required). */
+  freetouseBaseUrl: str("FREETOUSE_BASE_URL", "https://api.freetouse.com/v3"),
+
+  /** New mode tuning ------------------------------------------------------- */
+  /** Target narration length defaults (UI can override per job). */
+  movieTargetSec: num("MOVIE_TARGET_SEC", 90),
+  docTargetSec: num("DOC_TARGET_SEC", 120),
+  /** Documentary scene bounds. */
+  docMinSceneSec: num("DOC_MIN_SCENE_SEC", 6),
+  docMaxSceneSec: num("DOC_MAX_SCENE_SEC", 45),
+  docMinScenes: num("DOC_MIN_SCENES", 3),
+  docMaxScenes: num("DOC_MAX_SCENES", 8),
+  /** Narration word-rate used to estimate TTS duration (~145 wpm). */
+  narrationWordsPerSec: num("NARRATION_WORDS_PER_SEC", 2.4),
 
   /** Output --------------------------------------------------------------- */
   targetWidth: num("TARGET_WIDTH", 1080),
@@ -134,7 +189,38 @@ export const config = {
   maxClipSec: num("MAX_CLIP_SEC", 90),
 } as const;
 
-export type AnalysisProvider = "gemini" | "openrouter" | "groq";
+export type AnalysisProvider = "gemini" | "openrouter" | "groq" | "nvidia";
+
+/**
+ * Parse ANALYSIS_PROVIDERS. Unknown names are dropped so a typo can never
+ * break startup; the canonical order (gemini → openrouter → groq → nvidia)
+ * is enforced by providersConfigured, not by the list order.
+ */
+export function parseAnalysisProviderList(raw: string): AnalysisProvider[] {
+  // ANALYSIS_PROVIDERS controls the fallback ORDER: the list is honored
+  // exactly as written (trimmed, lowercased, deduped); unknown entries are
+  // dropped. Providers that are not configured are still skipped at request
+  // time by providersConfigured().
+  const valid = new Set<AnalysisProvider>(["gemini", "openrouter", "groq", "nvidia"]);
+  const order: AnalysisProvider[] = [];
+  const seen = new Set<AnalysisProvider>();
+  for (const entry of raw.split(",").map((p) => p.trim().toLowerCase())) {
+    if (!entry || !valid.has(entry as AnalysisProvider) || seen.has(entry as AnalysisProvider)) continue;
+    seen.add(entry as AnalysisProvider);
+    order.push(entry as AnalysisProvider);
+  }
+  return order;
+}
+
+export type AudioTtsProviderId = "gemini" | "openai" | "mock";
+export type AudioMusicProviderId = "b2" | "freetouse" | "mock";
+
+export function parseAudioProviderList<T extends string>(raw: string, valid: readonly T[]): T[] {
+  return raw
+    .split(",")
+    .map((p) => p.trim().toLowerCase())
+    .filter((p): p is T => (valid as unknown as string[]).includes(p));
+}
 
 export function transcriptionConfigured(): boolean {
   return config.groqApiKey.length > 0;
@@ -144,19 +230,18 @@ export function providersConfigured(): {
   gemini: boolean;
   groq: boolean;
   openrouter: boolean;
+  nvidia: boolean;
   order: AnalysisProvider[];
 } {
   const configured = {
     gemini: config.geminiApiKey.length > 0 && config.geminiTextModel.length > 0,
     groq: transcriptionConfigured() && config.groqTextModel.length > 0,
     openrouter: config.openrouterApiKey.length > 0 && config.openrouterTextModel.length > 0,
+    nvidia: config.nvidiaApiKey.length > 0 && config.nvidiaTextModel.length > 0,
   };
-  // Keep fallback deterministic even when an older deployment still has
-  // ANALYSIS_PROVIDERS=groq,openrouter. A configured direct Gemini key is
-  // always enabled and preferred; the env list can still disable fallbacks.
-  const enabled = new Set<AnalysisProvider>(config.analysisProviders);
-  if (configured.gemini) enabled.add("gemini");
-  const order = (["gemini", "openrouter", "groq"] as AnalysisProvider[])
-    .filter((provider) => enabled.has(provider) && configured[provider]);
+  // ANALYSIS_PROVIDERS sets the exact fallback order. Only providers that are
+  // BOTH listed and configured are used; everything else is skipped (and
+  // temporary unavailability is handled at request time by the router).
+  const order = config.analysisProviders.filter((provider) => configured[provider]);
   return { ...configured, order };
 }

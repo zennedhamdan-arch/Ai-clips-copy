@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { config, providersConfigured } from "@/lib/config";
 import { ensureRuntime, getJobStats, queueSnapshot } from "@/lib/jobs";
+import { audioProviderStatus } from "@/lib/audio/router";
+import { JOB_MODES } from "@/lib/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -9,6 +11,7 @@ export async function GET() {
   await ensureRuntime();
   const providers = providersConfigured();
   const stats = await getJobStats();
+  const audio = audioProviderStatus();
 
   return NextResponse.json({
     providers: {
@@ -17,10 +20,18 @@ export async function GET() {
       geminiConfigured: providers.gemini,
       groqConfigured: providers.groq,
       openrouterConfigured: providers.openrouter,
+      nvidiaConfigured: providers.nvidia,
       geminiModel: providers.gemini ? config.geminiTextModel : null,
       groqModel: config.groqTextModel,
       transcribeModel: config.groqTranscribeModel,
       openrouterModel: providers.openrouter ? config.openrouterTextModel : null,
+      nvidiaModel: providers.nvidia ? config.nvidiaTextModel : null,
+    },
+    modes: [...JOB_MODES],
+    audio: {
+      tts: audio.tts,
+      music: audio.music,
+      narrationConfigured: audio.tts.some((provider) => provider.ready),
     },
     limits: {
       maxUploadMb: config.maxUploadMb,
@@ -33,6 +44,8 @@ export async function GET() {
       maxClipSec: config.maxClipSec,
       retentionHours: config.retentionHours,
       maxConcurrentJobs: config.maxConcurrentJobs,
+      movieTargetSec: config.movieTargetSec,
+      docTargetSec: config.docTargetSec,
     },
     output: {
       defaultFormat: "9:16",

@@ -1,4 +1,4 @@
-import type { AnalysisCheckpoint } from "@/lib/types";
+import type { AnalysisCheckpoint, DocumentaryScene, ExplainerScript, JobMode, StoryAnalysisCheckpoint } from "@/lib/types";
 import {
   index,
   integer,
@@ -26,8 +26,16 @@ export const jobs = pgTable(
     stage: text("stage").notNull().default("queued"),
     stageDetail: text("stage_detail"),
     progress: integer("progress").notNull().default(0),
+    /** clips = legacy Video -> Shorts; movie_explainer and documentary add new pipelines. */
+    mode: text("mode").notNull().default("clips").$type<JobMode>(),
 
-    sourceType: text("source_type").notNull(), // upload | direct_url | dropbox | google_drive (`url` is legacy)
+    sourceType: text("source_type").notNull(), // upload | direct_url | dropbox | google_drive | idea (`url` is legacy)
+    /** Documentary idea/topic when mode = documentary. */
+    topic: text("topic"),
+    /** Optional pasted source material grounding the documentary research. */
+    topicText: text("topic_text"),
+    /** Desired narration length for movie/documentary jobs (seconds). */
+    targetSec: integer("target_sec"),
     sourceName: text("source_name").notNull(),
     sourceUrl: text("source_url"),
     /** Local path exists only while a worker is actively processing. */
@@ -63,6 +71,13 @@ export const jobs = pgTable(
     }>(),
     /** none | manual | auto; library assets are linked in job_media_assets. */
     mediaMode: text("media_mode").notNull().default("none"),
+
+    /** Resumable plot understanding (movie) or research + outline (documentary). */
+    storyAnalysis: jsonb("story_analysis").$type<StoryAnalysisCheckpoint>(),
+    /** Final original script with per-section narration checkpoints. */
+    script: jsonb("script").$type<ExplainerScript>(),
+    /** Documentary scene plan with per-scene asset/audio generation status. */
+    scenes: jsonb("scenes").$type<DocumentaryScene[]>(),
 
     analysisProvider: text("analysis_provider"),
     analysisModel: text("analysis_model"),
