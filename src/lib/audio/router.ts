@@ -2,6 +2,7 @@ import fsp from "node:fs/promises";
 import { config } from "../config";
 import { AppError } from "../errors";
 import { B2MusicProvider } from "./providers/b2-music";
+import { FishTtsProvider } from "./providers/fish-tts";
 import { FreetoUseMusicProvider } from "./providers/freetouse";
 import { GeminiTtsProvider } from "./providers/gemini-tts";
 import { MockMusicProvider, MockTtsProvider } from "./providers/mock";
@@ -48,6 +49,7 @@ function normalizeFailure(providerId: string, error: unknown): NormalizedFailure
 function buildTtsProviders(): TtsProvider[] {
   const registry: Record<string, TtsProvider> = {
     gemini: new GeminiTtsProvider(),
+    fish: new FishTtsProvider(),
     openai: new OpenAiTtsProvider(),
     mock: new MockTtsProvider(),
   };
@@ -95,7 +97,7 @@ export async function generateNarration(options: NarrationOptions): Promise<Narr
       {
         status: 503,
         detail:
-          "Set GEMINI_API_KEY (Gemini TTS, model TTS_GEMINI_MODEL) and/or OPENAI_API_KEY (OpenAI-compatible /audio/speech). " +
+          "Set GEMINI_API_KEY (Gemini TTS), FISH_API_KEY (Fish Audio TTS), and/or OPENAI_API_KEY (OpenAI-compatible /audio/speech). " +
           "For local testing only, set AUDIO_MOCK=1 and include mock in AUDIO_TTS_PROVIDERS.",
       },
     );
@@ -171,7 +173,7 @@ export function audioProviderStatus(): {
   tts: Array<{ id: string; label: string; ready: boolean }>;
   music: Array<{ id: string; label: string; ready: boolean }>;
 } {
-  const ttsAll: TtsProvider[] = [new GeminiTtsProvider(), new OpenAiTtsProvider(), new MockTtsProvider()];
+  const ttsAll: TtsProvider[] = [new GeminiTtsProvider(), new FishTtsProvider(), new OpenAiTtsProvider(), new MockTtsProvider()];
   const musicAll: MusicProvider[] = [new B2MusicProvider(), new FreetoUseMusicProvider(), new MockMusicProvider()];
   return {
     tts: ttsAll

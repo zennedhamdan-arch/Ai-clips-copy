@@ -145,7 +145,7 @@ export const config = {
 
   /** Shared audio layer (TTS narration + music/SFX) ------------------------ */
   /** Provider order for narration. mock is only honored when AUDIO_MOCK=1. */
-  audioTtsProviders: parseAudioProviderList(str("AUDIO_TTS_PROVIDERS", "gemini,openai"), ["gemini", "openai", "mock"]),
+  audioTtsProviders: parseAudioProviderList(str("AUDIO_TTS_PROVIDERS", "gemini,openai"), ["gemini", "fish", "openai", "mock"]),
   /** Provider order for generated background music. B2 Music Library first. */
   audioMusicProviders: parseAudioProviderList(str("AUDIO_MUSIC_PROVIDERS", "b2,freetouse"), ["b2", "freetouse", "mock"]),
   /** Testing-only offline provider; never enabled in production by default. */
@@ -161,6 +161,13 @@ export const config = {
   openaiTtsBaseUrl: str("OPENAI_TTS_BASE_URL", "https://api.openai.com/v1"),
   openaiTtsModel: str("OPENAI_TTS_MODEL", "tts-1"),
   openaiTtsVoice: str("OPENAI_TTS_VOICE", "alloy"),
+  /** Fish Audio TTS (documented endpoint POST /v1/tts; model chosen by header). */
+  fishApiKey: process.env.FISH_API_KEY?.trim() || "",
+  fishTtsBaseUrl: str("FISH_TTS_BASE_URL", "https://api.fish.audio"),
+  /** Free developer-tier model; the API falls back to s2.1-pro if unrecognized. */
+  fishTtsModel: str("FISH_TTS_MODEL", "s2.1-pro-free"),
+  /** Optional Fish voice model id (reference_id); empty = Fish's default voice. */
+  fishTtsVoice: str("FISH_TTS_VOICE", ""),
   /** Free To Use public music library (no API key required). */
   freetouseBaseUrl: str("FREETOUSE_BASE_URL", "https://api.freetouse.com/v3"),
 
